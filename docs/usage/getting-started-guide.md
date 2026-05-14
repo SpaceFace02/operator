@@ -13,12 +13,23 @@ Kind can be used with `docker` or `podman`. Although, we set `podman` as default
 export RUNTIME=docker
 ```
 
+Also make sure the container CLI environment variable is configured
+```console
+export CONTAINER_CLI=docker
+```
+
 In order to interact with the cluster, `kubectl` is required.
 ```console
 dnf install -y kubectl
 ```
 
-Our kind cluster configuration is available under the `kind` directory and it uses the script `scripts/create-cluster-kind.sh`. The cluster can be simply created by running:
+Our kind cluster configuration is available under the `kind` directory and it uses the script `scripts/create-cluster-kind.sh`. 
+Make sure any previously installed cluster is deleted before attempting to install a new one:
+```console
+make cluster-down
+```
+
+The cluster can be simply created by running:
 ```console
 make cluster-up
 ```
@@ -77,10 +88,28 @@ export AK_REGISTRATION_ADDR=attestation-key-register.trusted-execution-clusters.
 ```
 This example works with KubeVirt when the KBS is reachable using the pod networking.
 
+Make sure Kube-virt is also installed before trying to install the operator and testing functionality.
+```console
+make install-kubevirt
+```
+
 Finally, the operator can be installed with:
 ```console
 make install
 ```
+
+Wait for cluster to be ready:
+```console
+sleep 10m
+```
+
+Print cluster status
+```console
+kubectl -n trusted-execution-clusters get po,svc
+```
+
+
+Refer to the one-shot deploy script at the end of this README for a quick install once you've understood the process.
 
 Further customization of the project can be controlled with the following env variables:
 + NAMESPACE: sets the namespace where the operator will be deplyoed
@@ -132,3 +161,40 @@ kubectl logs -n trusted-execution-clusters <trustee-deplyoment>
 ```
 
 In the logs, trustee prints the content of the TPM PCR registers. They need to match with the reference values present in the configmap `trustee-data` under `reference-values.json`.
+
+## One shot deploy script
+
+```bash
+#! /bin/bash
+set -euo pipefail
+set -v
+
+# kind exports
+export CONTAINER_CLI=docker
+export RUNTIME=docker
+
+# oparator exports
+export AK_REGISTRATION_ADDR=attestation-key-register.trusted-execution-clusters.svc.cluster.local
+export TRUSTEE_ADDR=kbs-service.trusted-execution-clusters.svc.cluster.local
+export REGISTRY=localhost:5000/trusted-cluster-operator
+
+# clean and create new cluster
+make cluster-down
+make cluster-up
+make install-kubevirt
+
+# install operator
+make push
+make manifests
+make install
+
+# print cluster status
+kubectl -n trusted-execution-clusters get po,svc
+
+# wait for cluster to be ready
+sleep 10m
+
+# create Vm
+examples/create-ignition-secret.sh examples/ignition-coreos.json coreos-ignition-secret
+kubectl apply -f examples/vm-coreos-ign.yaml
+```
