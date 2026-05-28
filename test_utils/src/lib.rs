@@ -97,10 +97,8 @@ macro_rules! kube_apply {
                 args.extend_from_slice(&["--server-side", "--force-conflicts"])
             }
         )?
-        let apply_output = Command::new("kubectl")
-            .args(args)
-            .output()
-            .await?;
+        let mut cmd = get_k8s_platform().kubectl();
+        let apply_output = cmd.args(args).output().await?;
         if !apply_output.status.success() {
             let stderr = String::from_utf8_lossy(&apply_output.stderr);
             return Err(anyhow!("{} failed: {}", $log, stderr));
@@ -158,6 +156,7 @@ trait K8sPlatform: Send + Sync {
         service: &str,
         port: Option<i32>,
     ) -> Result<String>;
+    fn kubectl(&self) -> Command;
 }
 
 struct Kind {
@@ -233,6 +232,10 @@ impl K8sPlatform for Kind {
             None => url,
         })
     }
+
+    fn kubectl(&self) -> Command {
+        Command::new("kubectl")
+    }
 }
 
 #[async_trait::async_trait]
@@ -272,6 +275,10 @@ impl K8sPlatform for OpenShift {
         let domain = ingress.spec.domain.unwrap();
         Ok(format!("{service}-{namespace}.{domain}"))
     }
+
+    fn kubectl(&self) -> Command {
+        Command::new("oc")
+    }
 }
 
 #[async_trait::async_trait]
@@ -293,6 +300,10 @@ impl K8sPlatform for OtherK8s {
         _: Option<i32>,
     ) -> Result<String> {
         Err(anyhow!(SET_CLUSTER_ERR))
+    }
+
+    fn kubectl(&self) -> Command {
+        Command::new("kubectl")
     }
 }
 
