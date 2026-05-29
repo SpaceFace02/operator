@@ -148,6 +148,7 @@ trait K8sPlatform: Send + Sync {
         namespace: &str,
         service: &str,
         test_name: &str,
+        port: i32,
     ) -> Result<()>;
     async fn get_cluster_url(
         &self,
@@ -177,7 +178,14 @@ fn get_k8s_platform() -> Box<dyn K8sPlatform> {
 #[async_trait::async_trait]
 impl K8sPlatform for Kind {
     fn add_scc(&self, _: &mut serde_yaml::Value) {}
-    async fn expose(&self, client: &Client, namespace: &str, service: &str, _: &str) -> Result<()> {
+    async fn expose(
+        &self,
+        client: &Client,
+        namespace: &str,
+        service: &str,
+        _: &str,
+        _: i32,
+    ) -> Result<()> {
         if !self.public {
             return Ok(());
         }
@@ -247,9 +255,19 @@ impl K8sPlatform for OpenShift {
         resource_seq.push(serde_yaml::Value::String("scc.yaml".to_string()))
     }
 
-    async fn expose(&self, _: &Client, namespace: &str, service: &str, _: &str) -> Result<()> {
+    async fn expose(
+        &self,
+        _: &Client,
+        namespace: &str,
+        service: &str,
+        _: &str,
+        port: i32,
+    ) -> Result<()> {
         ensure_command("oc")?;
-        let args = ["expose", "service", service, "-n", namespace];
+        let mut args = vec!["create", "route", "passthrough", service, "-n", namespace];
+        let svc = format!("--service={service}");
+        let port = format!("--port={port}");
+        args.extend_from_slice(&[&svc, &port]);
         let output = Command::new("oc").args(args).output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -285,7 +303,7 @@ impl K8sPlatform for OpenShift {
 impl K8sPlatform for OtherK8s {
     fn add_scc(&self, _: &mut serde_yaml::Value) {}
 
-    async fn expose(&self, _: &Client, _: &str, _: &str, test_name: &str) -> Result<()> {
+    async fn expose(&self, _: &Client, _: &str, _: &str, test_name: &str, _: i32) -> Result<()> {
         let warn = "You appear to be on an environment that is not Kind or OpenShift. \
                     Ensure operator services are reachable";
         test_warn!(test_name, "{warn}");
@@ -867,17 +885,22 @@ impl TestContext {
 
         self.wait_for_deployment_ready(&deployments_api, "trusted-cluster-operator", 120)
             .await?;
-        self.wait_for_deployment_ready(&deployments_api, "register-server", 300)
+        self.wait_for_deployment_ready(&deployments_api, REGISTER_SERVER_DEPLOYMENT, 300)
             .await?;
-        self.wait_for_deployment_ready(&deployments_api, "trustee-deployment", 180)
+        self.wait_for_deployment_ready(&deployments_api, TRUSTEE_DEPLOYMENT, 180)
             .await?;
-        self.wait_for_deployment_ready(&deployments_api, "attestation-key-register", 120)
+        self.wait_for_deployment_ready(&deployments_api, ATTESTATION_KEY_REGISTER_DEPLOYMENT, 120)
             .await?;
 
         let platform = get_k8s_platform();
-        for svc in ["kbs-service", "attestation-key-register", "register-server"] {
+        let ak_port = ATTESTATION_KEY_REGISTER_PORT;
+        for (svc, port) in [
+            (TRUSTEE_SERVICE, TRUSTEE_PORT),
+            (ATTESTATION_KEY_REGISTER_SERVICE, ak_port),
+            (REGISTER_SERVER_SERVICE, REGISTER_SERVER_PORT),
+        ] {
             platform
-                .expose(&self.client, ns, svc, &self.test_name)
+                .expose(&self.client, ns, svc, &self.test_name, port)
                 .await?;
         }
 
