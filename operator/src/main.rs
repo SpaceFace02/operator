@@ -505,6 +505,7 @@ mod tests {
         };
 
         let clos = async |req: Request<Body>, _ctr| {
+            let is_status_patch = req.uri().path().ends_with("/status");
             match *req.method() {
                 Method::GET => {
                     let object_list = ObjectList::<TrustedExecutionCluster> {
@@ -514,7 +515,11 @@ mod tests {
                     };
                     Ok(serde_json::to_string(&object_list).unwrap())
                 }
-                Method::POST => Ok(serde_json::to_string(&dummy_cluster()).unwrap()),
+                // Patches which update the status field, like installing secrets, config maps etc.
+                Method::PATCH if !is_status_patch => {
+                    Ok(serde_json::to_string(&dummy_cluster()).unwrap())
+                }
+                // Patches which update the status field, to check whether foreign conditions are present and not overwritten.
                 Method::PATCH => {
                     let body = req.into_body().collect_bytes().await.unwrap().to_vec();
                     let body = String::from_utf8_lossy(&body);

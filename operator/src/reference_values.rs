@@ -442,16 +442,25 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use trusted_cluster_operator_test_utils::mock_client::*;
 
+    // Assert that the PCR config map is created with the correct owner reference and data.
     #[tokio::test]
     async fn test_create_pcrs_cm_success() {
-        let clos = |client| create_pcrs_config_map(client, Default::default());
-        test_create_success::<_, _, ConfigMap>(clos).await;
-    }
-
-    #[tokio::test]
-    async fn test_create_pcrs_cm_exists() {
-        let clos = |client| create_pcrs_config_map(client, Default::default());
-        test_create_already_exists(clos).await;
+        use kube::client::Body;
+        let clos = async |req: Request<Body>, _| {
+            let body = get_body_string(req).await;
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(v["metadata"]["ownerReferences"].as_array().is_some());
+            assert!(v["data"].as_object().unwrap().contains_key(PCR_CONFIG_FILE));
+            Ok(serde_json::to_string(&ConfigMap::default()).unwrap())
+        };
+        count_check!(1, clos, |client| {
+            let owner = OwnerReference {
+                name: "my-tec".to_string(),
+                uid: "tec-uid".to_string(),
+                ..Default::default()
+            };
+            assert!(create_pcrs_config_map(client, owner).await.is_ok());
+        });
     }
 
     #[tokio::test]
@@ -482,7 +491,7 @@ mod tests {
                 assert!(req.uri().path().contains(PCR_CONFIG_MAP));
                 Ok(serde_json::to_string(&dummy_pcrs_map()).unwrap())
             }
-            (2, &Method::GET) | (3, &Method::PUT) => {
+            (2, &Method::GET) | (3, &Method::PATCH) => {
                 assert!(req.uri().path().contains(trustee::TRUSTEE_DATA_MAP));
                 Ok(serde_json::to_string(&dummy_trustee_map()).unwrap())
             }
@@ -524,10 +533,30 @@ mod tests {
         );
     }
 
+    // Assert that the compute-pcrs job is created with the correct owner reference and label.
     #[tokio::test]
     async fn test_compute_fresh_pcrs_success() {
-        let clos = |client| compute_fresh_pcrs(generate_rv_ctx(client), "image", "registry");
-        test_create_success::<_, _, Job>(clos).await;
+        use kube::client::Body;
+        let clos = async |req: Request<Body>, _| {
+            let body = get_body_string(req).await;
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(v["metadata"]["ownerReferences"].as_array().is_some());
+            assert_eq!(v["metadata"]["labels"]["kind"], "compute-pcrs");
+            Ok(serde_json::to_string(&Job::default()).unwrap())
+        };
+        count_check!(1, clos, |client| {
+            let mut ctx = generate_rv_ctx(client);
+            ctx.owner_reference = OwnerReference {
+                name: "my-tec".to_string(),
+                uid: "tec-uid".to_string(),
+                ..Default::default()
+            };
+            assert!(
+                compute_fresh_pcrs(ctx, "test-image", "quay.io/test")
+                    .await
+                    .is_ok()
+            );
+        });
     }
 
     #[tokio::test]
@@ -546,7 +575,7 @@ mod tests {
                 assert!(req.uri().path().contains(PCR_CONFIG_MAP));
                 Ok(serde_json::to_string(&dummy_pcrs_map()).unwrap())
             }
-            (3, &Method::GET) | (4, &Method::PUT) => {
+            (3, &Method::GET) | (4, &Method::PATCH) => {
                 assert!(req.uri().path().contains(trustee::TRUSTEE_DATA_MAP));
                 Ok(serde_json::to_string(&dummy_trustee_map()).unwrap())
             }
@@ -555,6 +584,114 @@ mod tests {
         count_check!(5, clos, |client| {
             let ctx = generate_rv_ctx(client);
             assert!(disallow_image(ctx, "registry").await.is_ok());
+        });
+    }
+
+    // SSA related unit test helpers.
+
+    fn dummy_approved_image(name: &str, image: &str) -> ApprovedImage {
+        ApprovedImage {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: trusted_cluster_operator_lib::ApprovedImageSpec {
+                image: image.to_string(),
+            },
+            status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_image_add_reconcile_adopts_owner_and_updates_status() {
+        use kube::client::Body;
+        // Image is not owned yet, and is already committed in PCR map.
+        // 0: PATCH ApprovedImage (SSA owner adoption)
+        // 1-2: GET PCR_CONFIG_MAP
+        // 3: GET trustee-data,
+        // 4: PATCH trustee-data (Full data SSA apply with recomputed reference values)
+        // 5: PATCH /status (force SSA, as operator also writes to this.)
+        let clos = async |req: Request<Body>, ctr| match (ctr, req.method()) {
+            (0, &Method::PATCH) => {
+                assert!(!req.uri().path().contains("/status"));
+                let body = get_body_string(req).await;
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(v["kind"], "ApprovedImage");
+                assert!(v["metadata"]["ownerReferences"].as_array().is_some());
+                Ok(serde_json::to_string(&dummy_approved_image("cos", "ref")).unwrap())
+            }
+            (1, &Method::GET) | (2, &Method::GET) => {
+                Ok(serde_json::to_string(&dummy_pcrs_map()).unwrap())
+            }
+            (3, &Method::GET) | (4, &Method::PATCH) => {
+                Ok(serde_json::to_string(&dummy_trustee_map()).unwrap())
+            }
+            (5, &Method::PATCH) => {
+                assert!(req.uri().path().contains("/status"));
+                let query = req.uri().query().unwrap_or("");
+                assert!(
+                    query.contains("force=true"),
+                    "Status patch must use force: {query}"
+                );
+                Ok(serde_json::to_string(&dummy_approved_image("cos", "ref")).unwrap())
+            }
+            _ => panic!("unexpected API interaction: {req:?}, counter {ctr}"),
+        };
+        count_check!(6, clos, |client| {
+            let ctx = generate_rv_ctx(client);
+            let image = dummy_approved_image("cos", "ref");
+            assert!(image_add_reconcile(ctx, &image).await.is_ok());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_image_add_reconcile_already_owned_skips_adoption() {
+        // Image already owned by TEC, skips owner adoption patch.
+        // Still processes handle_new_image (already committed) and updates status.
+        let clos = async |req: Request<_>, ctr| match (ctr, req.method()) {
+            (0, &Method::GET) | (1, &Method::GET) => {
+                assert!(req.uri().path().contains(PCR_CONFIG_MAP));
+                Ok(serde_json::to_string(&dummy_pcrs_map()).unwrap())
+            }
+            (2, &Method::GET) | (3, &Method::PATCH) => {
+                assert!(req.uri().path().contains(trustee::TRUSTEE_DATA_MAP));
+                Ok(serde_json::to_string(&dummy_trustee_map()).unwrap())
+            }
+            (4, &Method::PATCH) => {
+                assert!(req.uri().path().contains("/status"));
+                Ok(serde_json::to_string(&dummy_approved_image("cos", "ref")).unwrap())
+            }
+            _ => panic!("unexpected API interaction: {req:?}, counter {ctr}"),
+        };
+        count_check!(5, clos, |client| {
+            let mut ctx = generate_rv_ctx(client);
+            ctx.owner_reference = OwnerReference {
+                kind: "TrustedExecutionCluster".to_string(),
+                uid: "tec-uid".to_string(),
+                name: "tec-test".to_string(),
+                api_version: "trusted-execution-clusters.io/v1alpha1".to_string(),
+                ..Default::default()
+            };
+            let mut image = dummy_approved_image("cos", "ref");
+            image.metadata.owner_references = Some(vec![ctx.owner_reference.clone()]);
+            let result = image_add_reconcile(ctx, &image).await;
+            assert!(result.is_ok());
+        });
+    }
+
+    #[tokio::test]
+    async fn test_image_add_reconcile_owner_adoption_error() {
+        // SSA owner adoption patch fails
+        let clos = async |req: Request<_>, ctr| match (ctr, req.method()) {
+            (0, &Method::PATCH) => Err(http::StatusCode::INTERNAL_SERVER_ERROR),
+            _ => panic!("unexpected API interaction: {req:?}, counter {ctr}"),
+        };
+        count_check!(1, clos, |client| {
+            let ctx = generate_rv_ctx(client);
+            let image = dummy_approved_image("cos", "ref");
+            let result = image_add_reconcile(ctx, &image).await;
+            assert!(result.is_err());
         });
     }
 }

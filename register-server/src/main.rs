@@ -367,9 +367,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_machine() {
-        let clos = async |_, _| Ok(serde_json::to_string(&dummy_machine()).unwrap());
+        use http::{Method, Request};
+        let clos = async |req: Request<_>, _| {
+            assert_eq!(req.method(), Method::POST, "Must use POST, not SSA PATCH");
+            let query = req.uri().query().unwrap_or("");
+            assert!(
+                query.contains(&format!("fieldManager={FIELD_MANAGER}")),
+                "Field manager must be '{FIELD_MANAGER}': {query}"
+            );
+
+            let body = get_body_string(req).await;
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["metadata"]["name"], "machine-my-uuid");
+            assert_eq!(v["spec"]["id"], "my-uuid");
+
+            let owners = v["metadata"]["ownerReferences"]
+                .as_array()
+                .expect("Machine must have ownerReferences");
+            assert_eq!(owners.len(), 1);
+            assert_eq!(owners[0]["kind"], "TrustedExecutionCluster");
+            assert_eq!(owners[0]["controller"], true, "TEC must be controller");
+            assert_eq!(owners[0]["blockOwnerDeletion"], true);
+            Ok(serde_json::to_string(&dummy_machine()).unwrap())
+        };
         count_check!(1, clos, |client| {
-            assert!(create_machine(client, "test", dummy_owner_reference())
+            assert!(create_machine(client, "my-uuid", dummy_owner_reference())
                 .await
                 .is_ok());
         });
