@@ -6,23 +6,25 @@
 use anyhow::{Context, Result, anyhow};
 use fs_extra::dir;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentCondition, DeploymentStatus};
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service, ServicePort, ServiceSpec};
-use kube::api::{DeleteParams, ObjectMeta};
+use k8s_openapi::api::core::v1::{
+    ConfigMap, LoadBalancerStatus, Namespace, Secret, Service, ServicePort, ServiceSpec,
+    ServiceStatus,
+};
+use kube::api::{DeleteParams, ObjectMeta, Patch};
 use kube::runtime::wait::await_condition;
 use kube::{Api, Client};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, env, sync::Once, time::Duration};
 use tokio::process::Command;
 use tokio::time::timeout;
 use trusted_cluster_operator_lib::certificates::{
-    Certificate, CertificateIssuerRef, CertificateSpec,
+    Certificate, CertificateIssuerRef, CertificateSpec, CertificateStatus,
 };
 use trusted_cluster_operator_lib::issuers::{Issuer, IssuerCa, IssuerSpec};
 
 use trusted_cluster_operator_lib::Machine;
 use trusted_cluster_operator_lib::TrustedExecutionCluster;
-use trusted_cluster_operator_lib::openshift_ingresses::Ingress;
-use trusted_cluster_operator_lib::routes::Route;
 use trusted_cluster_operator_lib::{endpoints::*, images::*};
 
 pub mod timer;
@@ -50,6 +52,9 @@ const ROOT_SECRET: &str = "root-secret";
 const REG_SECRET: &str = "reg-srv-secret";
 const TRUSTEE_SECRET: &str = "trustee-secret";
 const ATT_REG_SECRET: &str = "att-reg-secret";
+const REG_CERT: &str = "reg-srv-cert";
+const TRUSTEE_CERT: &str = "trustee-cert";
+const ATT_REG_CERT: &str = "att-reg-cert";
 
 pub fn compare_pcrs(actual: &[Pcr], expected: &[Pcr]) -> bool {
     if actual.len() != expected.len() {
@@ -169,7 +174,13 @@ fn kubectl() -> Command {
 #[auto_impl::auto_impl(Box)]
 trait K8sPlatform: Send + Sync {
     fn add_scc(&self, kustomization: &mut serde_yaml::Value);
-    async fn expose(&self, service: &str, test_name: &str, port: i32) -> Result<()>;
+    async fn expose(
+        &self,
+        service: &str,
+        deployment: &str,
+        cert_name: &str,
+        test_name: &str,
+    ) -> Result<()>;
     async fn get_cluster_url(&self, service: &str, port: Option<i32>) -> Result<String>;
 }
 
@@ -206,7 +217,7 @@ fn get_k8s_platform(client: &Client, namespace: &str) -> Box<dyn K8sPlatform> {
 #[async_trait::async_trait]
 impl K8sPlatform for Kind {
     fn add_scc(&self, _: &mut serde_yaml::Value) {}
-    async fn expose(&self, service: &str, _: &str, _: i32) -> Result<()> {
+    async fn expose(&self, service: &str, _: &str, _: &str, _: &str) -> Result<()> {
         if !self.public {
             return Ok(());
         }
@@ -257,6 +268,27 @@ impl K8sPlatform for Kind {
     }
 }
 
+enum OpenShiftHost {
+    Ip(String),
+    Hostname(String),
+    None,
+}
+
+impl OpenShift {
+    async fn get_url(&self, service: &str) -> OpenShiftHost {
+        let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
+        let Ok(svc) = services.get(service).await else {
+            return OpenShiftHost::None;
+        };
+        let ingress = &svc.status.unwrap().load_balancer.unwrap().ingress.unwrap()[0];
+        match (&ingress.hostname, &ingress.ip) {
+            (Some(hostname), _) => OpenShiftHost::Hostname(hostname.clone()),
+            (_, Some(ip)) => OpenShiftHost::Ip(ip.clone()),
+            (None, None) => OpenShiftHost::None,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl K8sPlatform for OpenShift {
     fn add_scc(&self, kustomization: &mut serde_yaml::Value) {
@@ -266,30 +298,81 @@ impl K8sPlatform for OpenShift {
         resource_seq.push(serde_yaml::Value::String("scc.yaml".to_string()))
     }
 
-    async fn expose(&self, service: &str, _: &str, port: i32) -> Result<()> {
-        ensure_command("oc")?;
-        let mut args = vec!["create", "route", "passthrough", service];
-        let svc = format!("--service={service}");
-        let port = format!("--port={port}");
-        args.extend_from_slice(&["-n", &self.namespace, &svc, &port]);
-        let output = Command::new("oc").args(args).output().await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("oc command failed: {stderr}"));
-        }
+    async fn expose(
+        &self,
+        service: &str,
+        deployment: &str,
+        cert_name: &str,
+        _: &str,
+    ) -> Result<()> {
+        let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pp = Default::default();
+        let json = json!({
+            "spec": {
+                "type": "LoadBalancer"
+            }
+        });
+        services.patch(service, &pp, &Patch::Merge(&json)).await?;
+        let has_ingress = |svc: Option<&Service>| {
+            let chk_lb = |bal: &LoadBalancerStatus| bal.ingress.is_some();
+            let chk_st = |st: &ServiceStatus| st.load_balancer.as_ref().map(chk_lb);
+            let chk_svc = |svc: &Service| svc.status.as_ref().and_then(chk_st);
+            svc.and_then(chk_svc).unwrap_or(false)
+        };
+        let ingress_ready = await_condition(services, service, has_ingress);
+        let ctx = format!("waiting for ingress on {service} to be ready");
+        let duration = scaled_duration(60);
+        timeout(duration, ingress_ready).await.context(ctx)??;
+
+        let certs: Api<Certificate> = Api::namespaced(self.client.clone(), &self.namespace);
+        let cert = certs.get(cert_name).await?;
+        let old_revision = cert.status.and_then(|st| st.revision).unwrap_or(0);
+        let cert_patch = match self.get_url(service).await {
+            OpenShiftHost::Ip(ip) => json!({
+                "spec": {
+                    "ipAddresses": [ip],
+                    "dnsNames": [],
+                }
+            }),
+            OpenShiftHost::Hostname(name) => json!({
+                "spec": {
+                    "dnsNames": [name],
+                    "ipAddresses": []
+                }
+            }),
+            OpenShiftHost::None => {
+                return Err(anyhow!("expected service {service}"));
+            }
+        };
+        let cert_merge = Patch::Merge(cert_patch);
+        certs.patch(cert_name, &pp, &cert_merge).await?;
+
+        let cert_reissued = |cert: Option<&Certificate>| {
+            let chk = |st: &CertificateStatus| st.revision.map(|r| r > old_revision);
+            cert.and_then(|c| c.status.as_ref().and_then(chk))
+                .unwrap_or(false)
+        };
+        let cert_done = await_condition(certs, cert_name, cert_reissued);
+        let ctx = format!("waiting for cert {cert_name} to have a rev newer than {old_revision}");
+        timeout(duration, cert_done).await.context(ctx)??;
+
+        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), &self.namespace);
+        deployments.restart(deployment).await?;
+
         Ok(())
     }
 
-    async fn get_cluster_url(&self, service: &str, _: Option<i32>) -> Result<String> {
-        let routes: Api<Route> = Api::namespaced(self.client.clone(), &self.namespace);
-        if let Ok(route) = routes.get(service).await {
-            return Ok(route.spec.host.expect("route existed, but had no host"));
-        }
-        // Fallback when route does not exist yet
-        let ingresses: Api<Ingress> = Api::all(self.client.clone());
-        let ingress = ingresses.get("cluster").await?;
-        let domain = ingress.spec.domain.unwrap();
-        Ok(format!("{service}-{}.{domain}", self.namespace))
+    async fn get_cluster_url(&self, service: &str, port: Option<i32>) -> Result<String> {
+        let append_port = |e| match port {
+            Some(p) => format!("{e}:{p}"),
+            None => e,
+        };
+        Ok(match self.get_url(service).await {
+            OpenShiftHost::Ip(ip) => append_port(ip),
+            OpenShiftHost::Hostname(name) => append_port(name),
+            // Service did not exist yet, put empty name in cert and patch upon expose
+            OpenShiftHost::None => String::new(),
+        })
     }
 }
 
@@ -297,7 +380,7 @@ impl K8sPlatform for OpenShift {
 impl K8sPlatform for OtherK8s {
     fn add_scc(&self, _: &mut serde_yaml::Value) {}
 
-    async fn expose(&self, _: &str, test_name: &str, _: i32) -> Result<()> {
+    async fn expose(&self, _: &str, _: &str, _: &str, test_name: &str) -> Result<()> {
         let warn = "You appear to be on an environment that is not Kind or OpenShift. \
                     Ensure operator services are reachable";
         test_warn!(test_name, "{warn}");
@@ -590,12 +673,12 @@ impl TestContext {
         issuers.create(&Default::default(), &issuer).await?;
 
         let svc = REGISTER_SERVER_SERVICE;
-        self.create_certificate(svc, "reg-srv-cert", REG_SECRET, issuer_name)
+        self.create_certificate(svc, REG_CERT, REG_SECRET, issuer_name)
             .await?;
-        self.create_certificate(TRUSTEE_SERVICE, "trustee-cert", TRUSTEE_SECRET, issuer_name)
+        self.create_certificate(TRUSTEE_SERVICE, TRUSTEE_CERT, TRUSTEE_SECRET, issuer_name)
             .await?;
         let svc = ATTESTATION_KEY_REGISTER_SERVICE;
-        self.create_certificate(svc, "att-reg-cert", ATT_REG_SECRET, issuer_name)
+        self.create_certificate(svc, ATT_REG_CERT, ATT_REG_SECRET, issuer_name)
             .await?;
 
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &self.test_namespace);
@@ -791,19 +874,12 @@ impl TestContext {
 
     async fn apply_cr_manifests(&self, manifests_path: &Path) -> Result<()> {
         let ns = &self.test_namespace;
-        let trustee_addr =
-            get_cluster_url(&self.client, ns, TRUSTEE_SERVICE, Some(TRUSTEE_PORT)).await?;
         let cr_manifest_path = manifests_path.join("trusted_execution_cluster_cr.yaml");
 
         let cr_content = std::fs::read_to_string(&cr_manifest_path)?;
         let mut cr_value: serde_yaml::Value = serde_yaml::from_str(&cr_content)?;
 
         let spec_map = cr_value.get_mut("spec").unwrap().as_mapping_mut().unwrap();
-        spec_map.insert(
-            serde_yaml::Value::String("publicTrusteeAddr".to_string()),
-            serde_yaml::Value::String(trustee_addr.clone()),
-        );
-
         spec_map.insert(
             serde_yaml::Value::String("trusteeSecret".to_string()),
             serde_yaml::Value::String(TRUSTEE_SECRET.to_string()),
@@ -829,11 +905,6 @@ impl TestContext {
 
         let updated_content = serde_yaml::to_string(&cr_value)?;
         std::fs::write(&cr_manifest_path, updated_content)?;
-
-        test_info!(
-            &self.test_name,
-            "Updated CR manifest with publicTrusteeAddr: {trustee_addr}",
-        );
 
         let cr_manifest_str = cr_manifest_path.to_str().unwrap();
         kube_apply!(cr_manifest_str, &self.test_name, "Applying CR manifest");
@@ -872,14 +943,30 @@ impl TestContext {
         }
 
         let platform = get_k8s_platform(&self.client, &self.test_namespace);
-        let ak_port = ATTESTATION_KEY_REGISTER_PORT;
-        for (svc, port) in [
-            (TRUSTEE_SERVICE, TRUSTEE_PORT),
-            (ATTESTATION_KEY_REGISTER_SERVICE, ak_port),
-            (REGISTER_SERVER_SERVICE, REGISTER_SERVER_PORT),
-        ] {
-            platform.expose(svc, &self.test_name, port).await?;
-        }
+        let svc = REGISTER_SERVER_SERVICE;
+        let depl = REGISTER_SERVER_DEPLOYMENT;
+        let test_name = &self.test_name;
+        platform.expose(svc, depl, REG_CERT, test_name).await?;
+        let svc = TRUSTEE_SERVICE;
+        let depl = TRUSTEE_DEPLOYMENT;
+        platform.expose(svc, depl, TRUSTEE_CERT, test_name).await?;
+        let svc = ATTESTATION_KEY_REGISTER_SERVICE;
+        let depl = ATTESTATION_KEY_REGISTER_DEPLOYMENT;
+        platform.expose(svc, depl, ATT_REG_CERT, test_name).await?;
+
+        let tecs: Api<TrustedExecutionCluster> = Api::namespaced(self.client.clone(), ns);
+        let trustee_addr =
+            get_cluster_url(&self.client, ns, TRUSTEE_SERVICE, Some(TRUSTEE_PORT)).await?;
+        let json = json!({
+            "spec": {
+                "publicTrusteeAddr": trustee_addr
+            }
+        });
+        let patch = Patch::Merge(&json);
+        tecs.patch("trusted-execution-cluster", &Default::default(), &patch)
+            .await?;
+        let info = format!("Updated TEC resource with publicTrusteeAddr: {trustee_addr}");
+        test_info!(&self.test_name, "{info}");
 
         test_info!(
             &self.test_name,

@@ -55,8 +55,6 @@ RBAC_YAML_PATH = config/rbac
 API_PATH = api/v1alpha1
 generate: $(CONTROLLER_GEN)
 	$(call controller-gen,./...,*)
-	$(call controller-gen,github.com/openshift/api/route/v1,*)
-	$(call controller-gen,github.com/openshift/api/config/v1,*_ingresses.yaml)
 	$(call controller-gen,github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1,*)
 
 RS_LIB_PATH = lib/src
