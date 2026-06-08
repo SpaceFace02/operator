@@ -3,15 +3,17 @@
 //
 // SPDX-License-Identifier: MIT
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use fs_extra::dir;
-use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::apps::v1::{Deployment, DeploymentCondition, DeploymentStatus};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service, ServicePort, ServiceSpec};
 use kube::api::{DeleteParams, ObjectMeta};
+use kube::runtime::wait::await_condition;
 use kube::{Api, Client};
 use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, env, sync::Once, time::Duration};
 use tokio::process::Command;
+use tokio::time::timeout;
 use trusted_cluster_operator_lib::certificates::{
     Certificate, CertificateIssuerRef, CertificateSpec,
 };
@@ -468,7 +470,7 @@ impl TestContext {
                 tec_api.delete(name, &dp).await?;
 
                 // Wait for the resource to be deleted
-                wait_for_resource_deleted(&tec_api, name, scaled_timeout(120), 5).await?;
+                wait_for_resource_deleted(&tec_api, name, scaled_timeout(120)).await?;
                 test_info!(
                     &self.test_name,
                     "TrustedExecutionCluster {} has been deleted",
@@ -491,7 +493,7 @@ impl TestContext {
                     "Waiting for Machine {} to be deleted",
                     name
                 );
-                wait_for_resource_deleted(&machine_api, name, 120, 5).await?;
+                wait_for_resource_deleted(&machine_api, name, scaled_timeout(120)).await?;
                 test_info!(&self.test_name, "Machine {} has been deleted", name);
             }
         }
@@ -506,13 +508,8 @@ impl TestContext {
         match namespace_api.get(&self.test_namespace).await {
             Ok(_) => {
                 namespace_api.delete(&self.test_namespace, &dp).await?;
-                wait_for_resource_deleted(
-                    &namespace_api,
-                    &self.test_namespace,
-                    scaled_timeout(300),
-                    5,
-                )
-                .await?;
+                let timeout = scaled_timeout(300);
+                wait_for_resource_deleted(&namespace_api, &self.test_namespace, timeout).await?;
                 test_info!(&self.test_name, "Deleted namespace {}", self.test_namespace);
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
@@ -545,49 +542,6 @@ impl TestContext {
             );
         }
         Ok(())
-    }
-
-    async fn wait_for_deployment_ready(
-        &self,
-        deployments_api: &Api<Deployment>,
-        deployment_name: &str,
-        timeout_secs: u64,
-    ) -> Result<()> {
-        test_info!(
-            &self.test_name,
-            "Waiting for deployment {} to be ready",
-            deployment_name
-        );
-        let poller = Poller::new()
-            .with_timeout(Duration::from_secs(timeout_secs))
-            .with_interval(Duration::from_secs(5))
-            .with_error_message(format!(
-                "{deployment_name} deployment does not have 1 available replica after {timeout_secs} seconds"
-            ));
-
-        let test_name_owned = self.test_name.clone();
-        poller
-            .poll_async(move || {
-                let api = deployments_api.clone();
-                let name = deployment_name.to_string();
-                let tn = test_name_owned.clone();
-                async move {
-                    let deployment = api.get(&name).await?;
-
-                    if let Some(status) = &deployment.status
-                        && let Some(available_replicas) = status.available_replicas
-                        && available_replicas == 1
-                    {
-                        test_info!(&tn, "{} deployment has 1 available replica", name);
-                        return Ok(());
-                    }
-
-                    Err(anyhow!(
-                        "{name} deployment does not have 1 available replica yet"
-                    ))
-                }
-            })
-            .await
     }
 
     async fn create_certificate(
@@ -682,9 +636,9 @@ impl TestContext {
             .await?;
 
         let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &self.test_namespace);
-        wait_for_resource_created(&secrets, REG_SECRET, scaled_timeout(60), 1).await?;
-        wait_for_resource_created(&secrets, TRUSTEE_SECRET, scaled_timeout(60), 1).await?;
-        wait_for_resource_created(&secrets, ATT_REG_SECRET, scaled_timeout(60), 1).await?;
+        for secret in [REG_SECRET, TRUSTEE_SECRET, ATT_REG_SECRET] {
+            wait_for_resource_created(&secrets, secret, scaled_timeout(60)).await?;
+        }
         Ok(())
     }
 
@@ -934,28 +888,27 @@ impl TestContext {
             "Applying ApprovedImage manifest"
         );
 
-        let deployments_api: Api<Deployment> = Api::namespaced(self.client.clone(), ns);
+        let depl_ready = |depl: Option<&Deployment>| {
+            let chk_cond = |c: &DeploymentCondition| c.type_ == "Available" && c.status == "True";
+            let chk_status =
+                |st: &DeploymentStatus| st.conditions.as_ref().map(|cs| cs.iter().any(chk_cond));
+            let chk = |depl: &Deployment| depl.status.as_ref().and_then(chk_status);
+            depl.and_then(chk).unwrap_or(false)
+        };
 
-        self.wait_for_deployment_ready(
-            &deployments_api,
+        let depls: Api<Deployment> = Api::namespaced(self.client.clone(), ns);
+        for depl in [
             "trusted-cluster-operator",
-            scaled_timeout(120),
-        )
-        .await?;
-        self.wait_for_deployment_ready(
-            &deployments_api,
             REGISTER_SERVER_DEPLOYMENT,
-            scaled_timeout(300),
-        )
-        .await?;
-        self.wait_for_deployment_ready(&deployments_api, TRUSTEE_DEPLOYMENT, scaled_timeout(180))
-            .await?;
-        self.wait_for_deployment_ready(
-            &deployments_api,
+            TRUSTEE_DEPLOYMENT,
             ATTESTATION_KEY_REGISTER_DEPLOYMENT,
-            scaled_timeout(120),
-        )
-        .await?;
+        ] {
+            let info = format!("Waiting for deployment {depl} to be ready");
+            test_info!(&self.test_name, "{info}");
+            let done = await_condition(depls.clone(), depl, depl_ready);
+            let ctx = format!("waiting for deployment {depl} to be ready");
+            timeout(scaled_duration(300), done).await.context(ctx)??;
+        }
 
         let platform = get_k8s_platform();
         let ak_port = ATTESTATION_KEY_REGISTER_PORT;
@@ -974,28 +927,7 @@ impl TestContext {
             "Waiting for image-pcrs ConfigMap to be created"
         );
         let configmap_api: Api<ConfigMap> = Api::namespaced(self.client.clone(), ns);
-
-        let err = format!("image-pcrs ConfigMap in the namespace {ns} not found");
-        let poller = Poller::new()
-            .with_timeout(scaled_duration(60))
-            .with_interval(Duration::from_secs(5))
-            .with_error_message(err);
-
-        let test_name_owned = self.test_name.clone();
-        let check_fn = move || {
-            let api = configmap_api.clone();
-            let tn = test_name_owned.clone();
-            async move {
-                let result = api.get("image-pcrs").await;
-                if result.is_ok() {
-                    test_info!(&tn, "image-pcrs ConfigMap created");
-                }
-                result
-            }
-        };
-        poller.poll_async(check_fn).await?;
-
-        Ok(())
+        wait_for_resource_created(&configmap_api, "image-pcrs", scaled_timeout(60)).await
     }
 }
 
@@ -1044,60 +976,34 @@ pub async fn wait_for_resource_created<K>(
     api: &Api<K>,
     resource_name: &str,
     timeout_secs: u64,
-    interval_secs: u64,
-) -> anyhow::Result<()>
+) -> Result<()>
 where
-    K: kube::Resource<DynamicType = ()> + Clone + std::fmt::Debug,
+    K: kube::Resource<DynamicType = ()> + Clone + std::fmt::Debug + Send + 'static,
     K: k8s_openapi::serde::de::DeserializeOwned,
 {
-    wait_for_resource_state(api, resource_name, timeout_secs, interval_secs, true).await
+    let created = |r: Option<&K>| r.is_some();
+    let done = await_condition(api.clone(), resource_name, created);
+    let type_ = std::any::type_name::<K>();
+    let ctx = format!("waiting {timeout_secs} for {type_} '{resource_name}' creation");
+    let duration = Duration::from_secs(timeout_secs);
+    timeout(duration, done).await.context(ctx)??;
+    Ok(())
 }
 
 pub async fn wait_for_resource_deleted<K>(
     api: &Api<K>,
     resource_name: &str,
     timeout_secs: u64,
-    interval_secs: u64,
 ) -> Result<()>
 where
-    K: kube::Resource<DynamicType = ()> + Clone + std::fmt::Debug,
+    K: kube::Resource<DynamicType = ()> + Clone + std::fmt::Debug + Send + 'static,
     K: k8s_openapi::serde::de::DeserializeOwned,
 {
-    wait_for_resource_state(api, resource_name, timeout_secs, interval_secs, false).await
-}
-
-async fn wait_for_resource_state<K>(
-    api: &Api<K>,
-    resource_name: &str,
-    timeout_secs: u64,
-    interval_secs: u64,
-    state: bool,
-) -> Result<()>
-where
-    K: kube::Resource<DynamicType = ()> + Clone + std::fmt::Debug,
-    K: k8s_openapi::serde::de::DeserializeOwned,
-{
-    let poller = Poller::new()
-        .with_timeout(Duration::from_secs(timeout_secs))
-        .with_interval(Duration::from_secs(interval_secs))
-        .with_error_message(format!(
-            "{resource_name} did not reach state {} after {timeout_secs} seconds",
-            if state { "created" } else { "deleted" }
-        ));
-
-    let check = || {
-        let api = api.clone();
-        let name = resource_name.to_string();
-        async move {
-            let result = api.get(&name).await;
-            if let Err(kube::Error::Api(ae)) = &result
-                && ae.code != 404
-            {
-                panic!("Unexpected error while fetching {name}: {ae:?}");
-            }
-            let err = anyhow!("{name} not in desired state: {result:?}");
-            (result.is_err() ^ state).then_some(()).ok_or(err)
-        }
-    };
-    poller.poll_async(check).await
+    let deleted = |r: Option<&K>| r.is_none();
+    let done = await_condition(api.clone(), resource_name, deleted);
+    let type_ = std::any::type_name::<K>();
+    let ctx = format!("waiting {timeout_secs} for {type_} '{resource_name}' deletion");
+    let duration = Duration::from_secs(timeout_secs);
+    timeout(duration, done).await.context(ctx)??;
+    Ok(())
 }
