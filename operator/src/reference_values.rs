@@ -268,6 +268,10 @@ async fn image_add_reconcile(
     cluster: Option<TrustedExecutionCluster>,
 ) -> Result<Action> {
     let name = image.metadata.name.as_ref().unwrap();
+    let Some(cluster) = cluster else {
+        info!("No TrustedExecutionCluster found, deferring image processing for {name}");
+        return Ok(Action::requeue(Duration::from_secs(5)));
+    };
     let uid_owns = |uid: &String| {
         let refs = image.metadata.owner_references.as_ref();
         refs.map(|os| os.iter().any(|o| o.uid == *uid))
@@ -277,9 +281,7 @@ async fn image_add_reconcile(
         uid.and_then(uid_owns).unwrap_or(false)
     };
     // Adopt the image by adding TEC as owner reference if not already owned
-    if let Some(cluster) = cluster
-        && !cluster_owns(&cluster)
-    {
+    if !cluster_owns(&cluster) {
         adopt_approved_image(client.clone(), name, &cluster).await?;
     }
 
