@@ -35,7 +35,7 @@ use operator::*;
 /// Default tag for Trustee image
 const TRUSTEE_VERSION: &str = "v0.17.0";
 /// Default version tag for operator-managed component images
-const COMPONENT_VERSION: &str = "0.2.0";
+const COMPONENT_VERSION: &str = "v0.2.0";
 /// Default registry
 const TEC_REGISTRY: &str = "quay.io/trusted-execution-clusters";
 
