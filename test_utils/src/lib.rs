@@ -773,7 +773,8 @@ impl TestContext {
         self.set_certificates().await?;
         let tec = "trustedexecutionclusters.trusted-execution-clusters.io";
         let args = ["get", "crd", tec];
-        let crd_check_output = Command::new("kubectl").args(args).output().await?;
+        let mut cmd = get_k8s_platform().kubectl();
+        let crd_check_output = cmd.args(args).output().await?;
 
         if crd_check_output.status.success() {
             test_info!(
