@@ -23,9 +23,8 @@ use trusted_cluster_operator_lib::certificates::{
 };
 use trusted_cluster_operator_lib::issuers::{Issuer, IssuerCa, IssuerSpec};
 
-use trusted_cluster_operator_lib::Machine;
-use trusted_cluster_operator_lib::TrustedExecutionCluster;
-use trusted_cluster_operator_lib::{endpoints::*, images::*};
+use trusted_cluster_operator_lib::{ApprovedImage, AttestationKey, Machine};
+use trusted_cluster_operator_lib::{TrustedExecutionCluster, endpoints::*, images::*};
 
 pub mod timer;
 pub use timer::Poller;
@@ -471,7 +470,16 @@ impl TestContext {
 
     pub async fn cleanup(&self) -> Result<()> {
         self.delete_trusted_execution_cluster().await?;
-        self.delete_machines().await?;
+        let timeout = scaled_duration(60);
+        let msg = format!("Resources were left behind after {timeout:?}");
+        let poller = Poller::new().with_timeout(timeout).with_error_message(msg);
+        let chk = || async move {
+            self.check_no_resources::<AttestationKey>().await?;
+            self.check_no_resources::<ApprovedImage>().await?;
+            self.check_no_resources::<Machine>().await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        poller.poll_async(chk).await?;
         self.cleanup_namespace().await?;
         self.cleanup_manifests_dir()?;
         Ok(())
@@ -499,6 +507,19 @@ impl TestContext {
         Ok(())
     }
 
+    async fn check_no_resources<K>(&self) -> Result<()>
+    where
+        K: kube::Resource<DynamicType = (), Scope = k8s_openapi::NamespaceResourceScope> + Clone,
+        K: k8s_openapi::serde::de::DeserializeOwned + std::fmt::Debug + Send + 'static,
+    {
+        let api: Api<K> = Api::namespaced(self.client.clone(), &self.test_namespace);
+        let list = api.list(&Default::default()).await?;
+        if let Some(item) = list.items.first() {
+            return Err(anyhow!("Resource still present: {item:?}"));
+        }
+        Ok(())
+    }
+
     async fn delete_trusted_execution_cluster(&self) -> Result<()> {
         let tec_api: Api<TrustedExecutionCluster> =
             Api::namespaced(self.client.clone(), &self.test_namespace);
@@ -522,25 +543,6 @@ impl TestContext {
                     "TrustedExecutionCluster {} has been deleted",
                     name
                 );
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn delete_machines(&self) -> Result<()> {
-        let machine_api: Api<Machine> = Api::namespaced(self.client.clone(), &self.test_namespace);
-        let machine_list = machine_api.list(&Default::default()).await?;
-
-        for machine in &machine_list.items {
-            if let Some(name) = &machine.metadata.name {
-                test_info!(
-                    &self.test_name,
-                    "Waiting for Machine {} to be deleted",
-                    name
-                );
-                wait_for_resource_deleted(&machine_api, name, scaled_timeout(120)).await?;
-                test_info!(&self.test_name, "Machine {} has been deleted", name);
             }
         }
 
