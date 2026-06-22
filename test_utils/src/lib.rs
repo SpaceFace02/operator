@@ -169,34 +169,36 @@ fn kubectl() -> Command {
 #[auto_impl::auto_impl(Box)]
 trait K8sPlatform: Send + Sync {
     fn add_scc(&self, kustomization: &mut serde_yaml::Value);
-    async fn expose(
-        &self,
-        client: &Client,
-        namespace: &str,
-        service: &str,
-        test_name: &str,
-        port: i32,
-    ) -> Result<()>;
-    async fn get_cluster_url(
-        &self,
-        client: &Client,
-        namespace: &str,
-        service: &str,
-        port: Option<i32>,
-    ) -> Result<String>;
+    async fn expose(&self, service: &str, test_name: &str, port: i32) -> Result<()>;
+    async fn get_cluster_url(&self, service: &str, port: Option<i32>) -> Result<String>;
 }
 
 struct Kind {
     public: bool,
+    client: Client,
+    namespace: String,
 }
-struct OpenShift {}
+struct OpenShift {
+    client: Client,
+    namespace: String,
+}
 struct OtherK8s {}
 
-fn get_k8s_platform() -> Box<dyn K8sPlatform> {
+fn get_k8s_platform(client: &Client, namespace: &str) -> Box<dyn K8sPlatform> {
+    let client = client.clone();
+    let namespace = namespace.to_string();
     match env::var(PLATFORM_ENV).as_deref().unwrap_or("kind") {
-        "kind" => Box::new(Kind { public: false }),
-        "kind_public" => Box::new(Kind { public: true }),
-        "openshift" => Box::new(OpenShift {}),
+        "kind" => Box::new(Kind {
+            public: false,
+            client,
+            namespace,
+        }),
+        "kind_public" => Box::new(Kind {
+            public: true,
+            client,
+            namespace,
+        }),
+        "openshift" => Box::new(OpenShift { client, namespace }),
         _ => Box::new(OtherK8s {}),
     }
 }
@@ -204,14 +206,7 @@ fn get_k8s_platform() -> Box<dyn K8sPlatform> {
 #[async_trait::async_trait]
 impl K8sPlatform for Kind {
     fn add_scc(&self, _: &mut serde_yaml::Value) {}
-    async fn expose(
-        &self,
-        client: &Client,
-        namespace: &str,
-        service: &str,
-        _: &str,
-        _: i32,
-    ) -> Result<()> {
+    async fn expose(&self, service: &str, _: &str, _: i32) -> Result<()> {
         if !self.public {
             return Ok(());
         }
@@ -235,7 +230,7 @@ impl K8sPlatform for Kind {
             port,
             ..Default::default()
         };
-        let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+        let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
         let service = Service {
             metadata: ObjectMeta {
                 name: Some(format!("{service}-forward")),
@@ -253,14 +248,8 @@ impl K8sPlatform for Kind {
         Ok(())
     }
 
-    async fn get_cluster_url(
-        &self,
-        _: &Client,
-        namespace: &str,
-        service: &str,
-        port: Option<i32>,
-    ) -> Result<String> {
-        let url = format!("{service}.{namespace}.svc.cluster.local");
+    async fn get_cluster_url(&self, service: &str, port: Option<i32>) -> Result<String> {
+        let url = format!("{service}.{}.svc.cluster.local", self.namespace);
         Ok(match port {
             Some(port) => format!("{url}:{port}"),
             None => url,
@@ -277,19 +266,12 @@ impl K8sPlatform for OpenShift {
         resource_seq.push(serde_yaml::Value::String("scc.yaml".to_string()))
     }
 
-    async fn expose(
-        &self,
-        _: &Client,
-        namespace: &str,
-        service: &str,
-        _: &str,
-        port: i32,
-    ) -> Result<()> {
+    async fn expose(&self, service: &str, _: &str, port: i32) -> Result<()> {
         ensure_command("oc")?;
-        let mut args = vec!["create", "route", "passthrough", service, "-n", namespace];
+        let mut args = vec!["create", "route", "passthrough", service];
         let svc = format!("--service={service}");
         let port = format!("--port={port}");
-        args.extend_from_slice(&[&svc, &port]);
+        args.extend_from_slice(&["-n", &self.namespace, &svc, &port]);
         let output = Command::new("oc").args(args).output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -298,22 +280,16 @@ impl K8sPlatform for OpenShift {
         Ok(())
     }
 
-    async fn get_cluster_url(
-        &self,
-        client: &Client,
-        namespace: &str,
-        service: &str,
-        _: Option<i32>,
-    ) -> Result<String> {
-        let routes: Api<Route> = Api::namespaced(client.clone(), namespace);
+    async fn get_cluster_url(&self, service: &str, _: Option<i32>) -> Result<String> {
+        let routes: Api<Route> = Api::namespaced(self.client.clone(), &self.namespace);
         if let Ok(route) = routes.get(service).await {
             return Ok(route.spec.host.expect("route existed, but had no host"));
         }
         // Fallback when route does not exist yet
-        let ingresses: Api<Ingress> = Api::all(client.clone());
+        let ingresses: Api<Ingress> = Api::all(self.client.clone());
         let ingress = ingresses.get("cluster").await?;
         let domain = ingress.spec.domain.unwrap();
-        Ok(format!("{service}-{namespace}.{domain}"))
+        Ok(format!("{service}-{}.{domain}", self.namespace))
     }
 }
 
@@ -321,26 +297,20 @@ impl K8sPlatform for OpenShift {
 impl K8sPlatform for OtherK8s {
     fn add_scc(&self, _: &mut serde_yaml::Value) {}
 
-    async fn expose(&self, _: &Client, _: &str, _: &str, test_name: &str, _: i32) -> Result<()> {
+    async fn expose(&self, _: &str, test_name: &str, _: i32) -> Result<()> {
         let warn = "You appear to be on an environment that is not Kind or OpenShift. \
                     Ensure operator services are reachable";
         test_warn!(test_name, "{warn}");
         Ok(())
     }
 
-    async fn get_cluster_url(
-        &self,
-        _: &Client,
-        _: &str,
-        _: &str,
-        _: Option<i32>,
-    ) -> Result<String> {
+    async fn get_cluster_url(&self, _: &str, _: Option<i32>) -> Result<String> {
         Err(anyhow!(SET_CLUSTER_ERR))
     }
 }
 
 pub async fn get_cluster_url(
-    client: Client,
+    client: &Client,
     namespace: &str,
     service: &str,
     port: Option<i32>,
@@ -352,8 +322,8 @@ pub async fn get_cluster_url(
             None => full_url,
         });
     }
-    get_k8s_platform()
-        .get_cluster_url(&client, namespace, service, port)
+    get_k8s_platform(client, namespace)
+        .get_cluster_url(service, port)
         .await
 }
 
@@ -545,7 +515,7 @@ impl TestContext {
         issuer_name: &str,
     ) -> Result<()> {
         let ns = &self.test_namespace;
-        let domain = get_cluster_url(self.client.clone(), ns, service_name, None).await?;
+        let domain = get_cluster_url(&self.client, ns, service_name, None).await?;
         let certs: Api<Certificate> = Api::namespaced(self.client.clone(), ns);
         let cert = Certificate {
             metadata: ObjectMeta {
@@ -775,7 +745,7 @@ impl TestContext {
         std::fs::write(&le_rb_dst, le_rb_content)?;
 
         test_info!(&self.test_name, "Preparing RBAC kustomization");
-        let platform = get_k8s_platform();
+        let platform = get_k8s_platform(&self.client, &self.test_namespace);
         let kustomization_src = workspace_root.join("config/rbac/kustomization.yaml.in");
         let kustomization_content = std::fs::read_to_string(&kustomization_src)?;
         let mut kustom_value: serde_yaml::Value = serde_yaml::from_str(&kustomization_content)?;
@@ -822,7 +792,7 @@ impl TestContext {
     async fn apply_cr_manifests(&self, manifests_path: &Path) -> Result<()> {
         let ns = &self.test_namespace;
         let trustee_addr =
-            get_cluster_url(self.client.clone(), ns, TRUSTEE_SERVICE, Some(TRUSTEE_PORT)).await?;
+            get_cluster_url(&self.client, ns, TRUSTEE_SERVICE, Some(TRUSTEE_PORT)).await?;
         let cr_manifest_path = manifests_path.join("trusted_execution_cluster_cr.yaml");
 
         let cr_content = std::fs::read_to_string(&cr_manifest_path)?;
@@ -848,10 +818,9 @@ impl TestContext {
         );
 
         if get_virt_provider()? == VirtProvider::Kubevirt {
-            let platform = get_k8s_platform();
-            let svc = ATTESTATION_KEY_REGISTER_SERVICE;
+            let platform = get_k8s_platform(&self.client, &self.test_namespace);
             let port = ATTESTATION_KEY_REGISTER_PORT;
-            let address = platform.get_cluster_url(&self.client, ns, svc, Some(port));
+            let address = platform.get_cluster_url(ATTESTATION_KEY_REGISTER_SERVICE, Some(port));
             spec_map.insert(
                 serde_yaml::Value::String("publicAttestationKeyRegisterAddr".to_string()),
                 serde_yaml::Value::String(address.await?),
@@ -902,16 +871,14 @@ impl TestContext {
             timeout(scaled_duration(300), done).await.context(ctx)??;
         }
 
-        let platform = get_k8s_platform();
+        let platform = get_k8s_platform(&self.client, &self.test_namespace);
         let ak_port = ATTESTATION_KEY_REGISTER_PORT;
         for (svc, port) in [
             (TRUSTEE_SERVICE, TRUSTEE_PORT),
             (ATTESTATION_KEY_REGISTER_SERVICE, ak_port),
             (REGISTER_SERVER_SERVICE, REGISTER_SERVER_PORT),
         ] {
-            platform
-                .expose(&self.client, ns, svc, &self.test_name, port)
-                .await?;
+            platform.expose(svc, &self.test_name, port).await?;
         }
 
         test_info!(
