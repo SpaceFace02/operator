@@ -7,7 +7,7 @@ module io/trustedexecutioncluster
 go 1.25.0
 
 require (
-	github.com/cert-manager/cert-manager v1.20.2
+	github.com/cert-manager/cert-manager v1.20.3
 	github.com/mikefarah/yq/v4 v4.53.3
 	github.com/projectcalico/api v0.0.0-20251022175904-f2ab03771208
 	k8s.io/api v0.35.3
