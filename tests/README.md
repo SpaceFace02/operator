@@ -6,7 +6,8 @@ The operator is installed in each namespace before running the actual tests with
 Upon a successful test, the namespace is cleaned up, otherwise it is kept for inspecting the state.
 
 ## Setup the integration tests locally
-The tests use [`virtctl`](https://kubevirt.io/user-guide/user_workloads/virtctl_client_tool/) in order to interact with
+
+The tests use `[virtctl](https://kubevirt.io/user-guide/user_workloads/virtctl_client_tool/)` in order to interact with
 VM, like getting the serial console and verifying that the guest has correctly booted by ssh-ing into it.
 
 Other dependencies: *openssl-devel, gcc-c++*
@@ -14,6 +15,7 @@ Other dependencies: *openssl-devel, gcc-c++*
 N.B KubeVirt requires the cluster to be run as a privileged container on the host in order to handle the devices. Therefore, for now, we have moved to Docker with kind in order to generate the cluster. In the future, we might be able to move to rootful podman.
 
 Run the tests locally with kind:
+
 ```bash
 export RUNTIME=docker
 make cluster-up
@@ -28,15 +30,17 @@ make integration-tests
 ```
 
 To run only one test set:
+
 ```bash
 make attestation-tests
 make trusted-execution-cluster-tests
 ```
 
-Each test can also be run independently using cargo test. \
+Each test can also be run independently using cargo test.   
 Before running independent tests, run `make trusted-cluster-gen` to create the default boiler-plate yaml manifests for the TEC and make sure `TRUSTEE_IMAGE`, `APPROVED_IMAGE`, `TEST_IMAGE`, `RUST_LOG`, `REGISTRY`, `TAG` env variables are set.
 
 Example:
+
 ```bash
 $ cargo test test_trusted_execution_cluster_uninstall  -- --no-capture
 ```
@@ -76,7 +80,7 @@ They rely on real [Azure Confidential VMs](https://learn.microsoft.com/en-us/azu
 
 #### Preparing an image
 
-The image to boot the VM from must reside in a _storage container_ inside a _storage account_ and be referenced to from a _compute gallery_, all of which exist in a _resource group_.
+The image to boot the VM from must reside in a *storage container* inside a *storage account* and be referenced to from a *compute gallery*, all of which exist in a *resource group*.
 This guide assumes that you have created the Azure resources in italics, and that you are logged in with the Azure CLI.
 
 Create a CoreOS Azure image VHD, e.g. as per the [investigations repository](https://github.com/trusted-execution-clusters/investigations), **without the `tpm-attester` feature** in its trustee-attester until [trustee-gc#1277](https://github.com/confidential-containers/guest-components/issues/1277) is resolved.
@@ -117,3 +121,4 @@ export VIRT_PROVIDER=azure
 # Run tests, or run individual tests as described above
 make integration-tests
 ```
+

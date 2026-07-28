@@ -204,7 +204,7 @@ type ApprovedImage struct {
 	// +required
 	Spec ApprovedImageSpec `json:"spec"`
 
-	// status defines the observed state of ApprovedImage
+	// status defines the observed state of  ApprovedImage
 	// +optional
 	Status ApprovedImageStatus `json:"status,omitempty,omitzero"`
 }
