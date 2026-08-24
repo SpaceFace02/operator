@@ -9,8 +9,7 @@ use fs_extra::dir;
 use glob::glob;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{
-    ConfigMap, LoadBalancerStatus, Namespace, Secret, Service, ServicePort, ServiceSpec,
-    ServiceStatus,
+    LoadBalancerStatus, Namespace, Secret, Service, ServicePort, ServiceSpec, ServiceStatus,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::api::{DeleteParams, ObjectMeta, Patch};
@@ -27,7 +26,6 @@ use trusted_cluster_operator_lib::certificates::{
 };
 use trusted_cluster_operator_lib::conditions::COMMITTED_CONDITION;
 use trusted_cluster_operator_lib::issuers::{Issuer, IssuerCa, IssuerSpec};
-use trusted_cluster_operator_lib::reference_values::ImagePcrs;
 
 use trusted_cluster_operator_lib::{ApprovedImage, ApprovedImageStatus, AttestationKey, Machine};
 use trusted_cluster_operator_lib::{TrustedExecutionCluster, endpoints::*, images::*};
@@ -1056,12 +1054,9 @@ impl TestContext {
         let info = format!("Updated TEC resource with publicTrusteeAddr: {trustee_addr}");
         self.info(info);
 
-        self.info("Waiting for image-pcrs ConfigMap to be created");
-        let configmap_api: Api<ConfigMap> = Api::namespaced(self.client.clone(), ns);
-        wait_for_resource_created(&configmap_api, "image-pcrs", scaled_timeout(60)).await?;
-
         let info = format!("Waiting for ApprovedImage {APPROVED_IMAGE_NAME} to be Committed");
         self.info(info);
+
         let images: Api<ApprovedImage> = Api::namespaced(self.client.clone(), ns);
         let image_ready = |img: Option<&ApprovedImage>| {
             let chk_cond = |c: &Condition| c.type_ == COMMITTED_CONDITION && c.status == "True";
@@ -1083,26 +1078,67 @@ impl TestContext {
         let client = self.client();
         let namespace = self.namespace();
 
-        let configmap_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-        let populated = |cm: Option<&ConfigMap>| {
-            let data = cm.and_then(|cm| cm.data.as_ref());
-            let json = data.and_then(|data| data.get("image-pcrs.json"));
-            let pcrs = json.and_then(|json| serde_json::from_str::<ImagePcrs>(json).ok());
-            pcrs.map(|pcrs| {
-                pcrs.0.len() == expected_pcrs.len()
-                    && pcrs.0.values().all(|image_data| {
-                        expected_pcrs
-                            .iter()
-                            .any(|exp| compare_pcrs(&image_data.pcrs, exp))
-                    })
-            })
-            .unwrap_or(false)
-        };
-        let done = await_condition(configmap_api.clone(), "image-pcrs", populated);
-        let ctx = "waiting for ConfigMap image-pcrs to be populated with expected PCR values";
-        timeout(scaled_duration(180), done).await.context(ctx)??;
+        let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
 
-        Ok(())
+        let poller = Poller::new()
+            .with_timeout(scaled_duration(180))
+            .with_error_message("Timed out waiting for ApprovedImages to have expected PCR values");
+
+        poller
+            .poll_async(|| async {
+                let image_list = images
+                    .list(&Default::default())
+                    .await
+                    .map_err(|e| format!("list failed: {e}"))?;
+                let committed: Vec<_> = image_list
+                    .items
+                    .iter()
+                    .filter(|img| {
+                        img.status
+                            .as_ref()
+                            .and_then(|s| s.conditions.as_ref())
+                            .is_some_and(|cs| {
+                                cs.iter()
+                                    .any(|c| c.type_ == COMMITTED_CONDITION && c.status == "True")
+                            })
+                    })
+                    .collect();
+
+                if committed.len() != expected_pcrs.len() {
+                    return Err(format!(
+                        "expected {} committed images, found {}",
+                        expected_pcrs.len(),
+                        committed.len()
+                    ));
+                }
+
+                let all_match = committed.iter().all(|img| {
+                    let status_pcrs = img.status.as_ref().and_then(|s| s.pcrs.as_ref());
+                    let Some(status_pcrs) = status_pcrs else {
+                        return false;
+                    };
+                    let actual_pcrs: Vec<Pcr> = status_pcrs
+                        .iter()
+                        .filter_map(|sp| {
+                            hex::decode(&sp.value).ok().map(|v| Pcr {
+                                id: sp.id as u64,
+                                value: v,
+                                events: vec![],
+                            })
+                        })
+                        .collect();
+                    expected_pcrs
+                        .iter()
+                        .any(|exp| compare_pcrs(&actual_pcrs, exp))
+                });
+
+                if all_match {
+                    Ok(())
+                } else {
+                    Err("PCR values didn't match expected".to_string())
+                }
+            })
+            .await
     }
 }
 

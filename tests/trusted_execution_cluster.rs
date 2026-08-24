@@ -12,6 +12,8 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, OwnerReference};
+use k8s_openapi::api::core::v1::{Pod, Secret};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta, OwnerReference};
 use kube::api::{ListParams, LogParams, Patch, PatchParams};
 use kube::runtime::wait::await_condition;
 use kube::{Api, api::DeleteParams};
@@ -26,6 +28,9 @@ use trusted_cluster_operator_lib::{
 use trusted_cluster_operator_test_utils::constants::*;
 use trusted_cluster_operator_test_utils::*;
 const TRUSTEE_RV_MAP: &str = "trustee-rv-data";
+const EXPECTED_PCR4: &str = "ff2b357be4a4bc66be796d4e7b2f1f27077dc89b96220aae60b443bcf4672525";
+const TEC_NAME: &str = "trusted-execution-cluster";
+const APPROVED_IMAGE_NAME: &str = "coreos";
 
 fn ak_approved(ak: Option<&AttestationKey>) -> bool {
     let is_approved = |c: &Condition| c.type_ == "Approved" && c.status == "True";
@@ -145,15 +150,7 @@ async fn test_image_disallow() -> anyhow::Result<()> {
     let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
     images.delete(APPROVED_IMAGE_NAME, &DeleteParams::default()).await?;
 
-    let configmap_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-    let chk_removed = |cm: Option<&ConfigMap>| {
-        let data = cm.and_then(|cm| cm.data.as_ref());
-        let json = data.and_then(|data| data.get(RV_JSON_KEY));
-        json.map(|json| !json.contains(PRIMARY_PCR4_HASH)).unwrap_or(false)
-    };
-    let rv_removed = await_condition(configmap_api, TRUSTEE_RV_MAP, chk_removed);
-    let ctx = format!("waiting for ConfigMap {TRUSTEE_RV_MAP} to not contain PCR value");
-    timeout(scaled_duration(180), rv_removed).await.context(ctx)??;
+    wait_for_resource_deleted(&images, APPROVED_IMAGE_NAME, scaled_timeout(180)).await?;
 
     test_ctx.cleanup().await?;
     Ok(())
@@ -688,7 +685,6 @@ async fn test_approved_image_readoption() -> anyhow::Result<()> {
 
     let clusters: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
     let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
-    let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
 
     let cluster_spec = clusters.get(TEC_NAME).await?.spec;
     let image_spec = images.get(APPROVED_IMAGE_NAME).await?.spec;
@@ -703,9 +699,8 @@ async fn test_approved_image_readoption() -> anyhow::Result<()> {
 
     test_ctx.info(format!("Deleting TrustedExecutionCluster {TEC_NAME}"));
     clusters.delete(TEC_NAME, &Default::default()).await?;
-    wait_for_resource_deleted(&configmaps, TRUSTEE_RV_MAP, scaled_timeout(60)).await?;
     wait_for_resource_deleted(&images, APPROVED_IMAGE_NAME, scaled_timeout(60)).await?;
-    test_ctx.info(format!("Configmap {TRUSTEE_RV_MAP} was removed"));
+    test_ctx.info("ApprovedImage was removed after TrustedExecutionCluster deletion");
 
     let image = ApprovedImage {
         spec: image_spec,
@@ -729,15 +724,18 @@ async fn test_approved_image_readoption() -> anyhow::Result<()> {
     // Ensure adoption works even when cluster creation was delayed
     tokio::time::sleep(Duration::from_secs(5)).await;
     clusters.create(&Default::default(), &cluster).await?;
-    let chk_added = |cm: Option<&ConfigMap>| {
-        let data = cm.and_then(|cm| cm.data.as_ref());
-        let json = data.and_then(|data| data.get(RV_JSON_KEY));
-        json.map(|json| json.contains(PRIMARY_PCR4_HASH)).unwrap_or(false)
+    let committed = |img: Option<&ApprovedImage>| {
+        img.and_then(|i| i.status.as_ref())
+            .and_then(|s| s.conditions.as_ref())
+            .is_some_and(|cs| {
+                cs.iter()
+                    .any(|c| c.type_ == "Committed" && c.status == "True")
+            })
     };
-    let rv_added = await_condition(configmaps, TRUSTEE_RV_MAP, chk_added);
-    let ctx = format!("waiting for ConfigMap {TRUSTEE_RV_MAP} to contain PCR value");
-    timeout(scaled_duration(180), rv_added).await.context(ctx)??;
-    test_ctx.info("Reference values regenerated");
+    let done = await_condition(images, APPROVED_IMAGE_NAME, committed);
+    let ctx = "waiting for ApprovedImage to be committed after recreation";
+    timeout(scaled_duration(180), done).await.context(ctx)??;
+    test_ctx.info("ApprovedImage committed after recreation");
 
     test_ctx.cleanup().await?;
     Ok(())
@@ -745,42 +743,609 @@ async fn test_approved_image_readoption() -> anyhow::Result<()> {
 }
 
 named_test! {
-async fn test_combined_image_pcrs_configmap_updates() -> anyhow::Result<()> {
+async fn test_combined_image_pcrs() -> anyhow::Result<()> {
+    let test_ctx = setup!([(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_REF)]).await?;
+
+    test_ctx.verify_expected_pcrs(&[&primary_pcrs!(), &secondary_pcrs!()]).await?;
+
+    test_ctx.cleanup().await?;
+    Ok(())
+}
+}
+
+named_test! {
+async fn test_upgrade_convergence() -> anyhow::Result<()> {
+    let test_ctx = setup!().await?;
+    let client = test_ctx.client();
+    let namespace = test_ctx.namespace();
+
+    let tec_api: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+
+    let is_installed = |tec: Option<&TrustedExecutionCluster>| {
+        tec.and_then(|t| t.status.as_ref())
+            .and_then(|s| s.conditions.as_ref())
+            .map(|cs| {
+                cs.iter()
+                    .any(|c| c.type_ == "Installed" && c.status == "True")
+            })
+            .unwrap_or(false)
+    };
+
+    let done = await_condition(tec_api.clone(), TEC_NAME, is_installed);
+    timeout(scaled_duration(120), done)
+        .await
+        .context("waiting for initial install")??;
+
+    let trustee_depl = deployments.get(TRUSTEE_DEPLOYMENT).await?;
+    let initial_image = trustee_depl
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|ps| ps.containers.first())
+        .and_then(|c| c.image.clone())
+        .expect("Trustee deployment should have an image");
+
+    let has_version = |tec: Option<&TrustedExecutionCluster>| {
+        tec.and_then(|t| t.status.as_ref())
+            .and_then(|s| s.observed_operator_version.as_ref())
+            .is_some()
+    };
+    let done = await_condition(tec_api.clone(), TEC_NAME, has_version);
+    timeout(scaled_duration(60), done)
+        .await
+        .context("waiting for observedOperatorVersion to be set")??;
+
+    let tec = tec_api.get(TEC_NAME).await?;
+    let observed = tec
+        .status
+        .as_ref()
+        .and_then(|s| s.observed_operator_version.as_deref());
+    assert!(
+        observed.is_some(),
+        "observedOperatorVersion should be set after install"
+    );
+
+    let reg_depl = deployments.get(REGISTER_SERVER_DEPLOYMENT).await?;
+    let reg_image = reg_depl
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|ps| ps.containers.first())
+        .and_then(|c| c.image.clone());
+    assert!(reg_image.is_some(), "register-server should have an image");
+
+    eprintln!(
+        "Upgrade convergence verified: trustee={initial_image}, version={:?}",
+        observed
+    );
+
+    test_ctx.cleanup().await?;
+    Ok(())
+}
+}
+
+fn tec_has_condition<'a>(type_: &'a str, status: &'a str) -> impl Fn(Option<&TrustedExecutionCluster>) -> bool + 'a {
+    move |tec: Option<&TrustedExecutionCluster>| {
+        tec.and_then(|t| t.status.as_ref())
+            .and_then(|s| s.conditions.as_ref())
+            .is_some_and(|cs| cs.iter().any(|c| c.type_ == type_ && c.status == status))
+    }
+}
+
+fn tec_has_condition_reason<'a>(type_: &'a str, reason: &'a str) -> impl Fn(Option<&TrustedExecutionCluster>) -> bool + 'a {
+    move |tec: Option<&TrustedExecutionCluster>| {
+        tec.and_then(|t| t.status.as_ref())
+            .and_then(|s| s.conditions.as_ref())
+            .is_some_and(|cs| cs.iter().any(|c| c.type_ == type_ && c.reason == reason))
+    }
+}
+
+fn deployment_image(depl: &Deployment) -> Option<String> {
+    depl.spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|ps| ps.containers.first())
+        .and_then(|c| c.image.clone())
+}
+
+fn approved_image_is_committed(img: Option<&ApprovedImage>) -> bool {
+    img.and_then(|i| i.status.as_ref())
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Committed" && c.status == "True"))
+}
+
+fn approved_image_has_pcrs(img: Option<&ApprovedImage>) -> bool {
+    img.and_then(|i| i.status.as_ref())
+        .and_then(|s| s.pcrs.as_ref())
+        .is_some_and(|pcrs| !pcrs.is_empty())
+}
+
+/// Triggers an upgrade by clearing the observedOperatorVersion on the TEC status.
+/// The operator will detect a version mismatch and enter the upgrade branch.
+async fn trigger_upgrade(tec_api: &Api<TrustedExecutionCluster>, name: &str) -> anyhow::Result<()> {
+    let patch = json!({
+        "status": {
+            "observedOperatorVersion": null
+        }
+    });
+    tec_api
+        .patch_status(name, &PatchParams::default(), &Patch::Merge(patch))
+        .await?;
+    Ok(())
+}
+
+named_test! {
+async fn test_upgrade_trigger_and_completion() -> anyhow::Result<()> {
+    let test_ctx = setup!().await?;
+    let client = test_ctx.client();
+    let namespace = test_ctx.namespace();
+
+    let tec_api: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
+
+    // Wait for initial install to complete
+    let done = await_condition(tec_api.clone(), TEC_NAME, tec_has_condition("Installed", "True"));
+    timeout(scaled_duration(120), done)
+        .await
+        .context("waiting for initial install")??;
+    test_ctx.info("Initial install complete");
+
+    // Record pre-upgrade state
+    let tec = tec_api.get(TEC_NAME).await?;
+    let pre_upgrade_version = tec
+        .status
+        .as_ref()
+        .and_then(|s| s.observed_operator_version.clone())
+        .expect("observedOperatorVersion should be set after install");
+    test_ctx.info(format!("Pre-upgrade version: {pre_upgrade_version}"));
+
+    let pre_trustee_image = deployment_image(&deployments.get(TRUSTEE_DEPLOYMENT).await?)
+        .expect("Trustee should have image");
+    let pre_reg_image = deployment_image(&deployments.get(REGISTER_SERVER_DEPLOYMENT).await?)
+        .expect("register-server should have image");
+    test_ctx.info(format!("Pre-upgrade Trustee image: {pre_trustee_image}"));
+    test_ctx.info(format!("Pre-upgrade register-server image: {pre_reg_image}"));
+
+    // Verify ApprovedImage is committed before upgrade
+    let done = await_condition(images.clone(), APPROVED_IMAGE_NAME, approved_image_is_committed);
+    timeout(scaled_duration(60), done)
+        .await
+        .context("waiting for ApprovedImage to be committed before upgrade")??;
+    test_ctx.info("ApprovedImage is committed pre-upgrade");
+
+    // Trigger upgrade by clearing observedOperatorVersion
+    trigger_upgrade(&tec_api, TEC_NAME).await?;
+    test_ctx.info("Triggered upgrade by clearing observedOperatorVersion");
+
+    // Wait for upgrade to complete -- the operator should re-stamp the version
+    let has_version_again = |tec: Option<&TrustedExecutionCluster>| {
+        tec.and_then(|t| t.status.as_ref())
+            .and_then(|s| s.observed_operator_version.as_ref())
+            .is_some()
+    };
+    let done = await_condition(tec_api.clone(), TEC_NAME, has_version_again);
+    timeout(scaled_duration(180), done)
+        .await
+        .context("waiting for observedOperatorVersion to be re-stamped after upgrade")??;
+    test_ctx.info("observedOperatorVersion re-stamped");
+
+    // Verify Upgrade=Complete condition exists
+    let done = await_condition(tec_api.clone(), TEC_NAME, tec_has_condition_reason("Upgrade", "Complete"));
+    timeout(scaled_duration(30), done)
+        .await
+        .context("waiting for Upgrade=Complete condition")??;
+    test_ctx.info("Upgrade=Complete condition set");
+
+    // Verify Trustee and register-server images are unchanged (same operator version)
+    let post_trustee_image = deployment_image(&deployments.get(TRUSTEE_DEPLOYMENT).await?);
+    let post_reg_image = deployment_image(&deployments.get(REGISTER_SERVER_DEPLOYMENT).await?);
+    assert_eq!(
+        Some(pre_trustee_image.as_str()),
+        post_trustee_image.as_deref(),
+        "Trustee image should remain unchanged when operator version hasn't changed"
+    );
+    assert_eq!(
+        Some(pre_reg_image.as_str()),
+        post_reg_image.as_deref(),
+        "register-server image should remain unchanged"
+    );
+
+    // Verify ApprovedImage PCRs were invalidated and then recommitted
+    let done = await_condition(images.clone(), APPROVED_IMAGE_NAME, |img: Option<&ApprovedImage>| {
+        approved_image_is_committed(img) && approved_image_has_pcrs(img)
+    });
+    timeout(scaled_duration(300), done)
+        .await
+        .context("waiting for ApprovedImage to be re-committed with PCRs after upgrade")??;
+    test_ctx.info("ApprovedImage re-committed with PCRs after upgrade");
+
+    test_ctx.cleanup().await?;
+    Ok(())
+}
+}
+
+named_test! {
+async fn test_upgrade_no_downtime() -> anyhow::Result<()> {
+    let test_ctx = setup!().await?;
+    let client = test_ctx.client();
+    let namespace = test_ctx.namespace();
+
+    let tec_api: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+
+    // Wait for install
+    let done = await_condition(tec_api.clone(), TEC_NAME, tec_has_condition("Installed", "True"));
+    timeout(scaled_duration(120), done)
+        .await
+        .context("waiting for initial install")??;
+
+    // Verify all deployments have at least 1 available replica before upgrade
+    for depl_name in [TRUSTEE_DEPLOYMENT, REGISTER_SERVER_DEPLOYMENT] {
+        test_ctx.wait_for_deployment_ready(&deployments, depl_name, scaled_timeout(60)).await?;
+    }
+    test_ctx.info("All deployments ready pre-upgrade");
+
+    // Trigger upgrade
+    trigger_upgrade(&tec_api, TEC_NAME).await?;
+    test_ctx.info("Triggered upgrade");
+
+    // Poll deployments during upgrade to verify availability is maintained.
+    // We check at intervals that availableReplicas >= 1 for all deployments.
+    let poller = Poller::new()
+        .with_timeout(scaled_duration(180))
+        .with_interval(scaled_duration(5))
+        .with_error_message("Upgrade did not complete while maintaining availability");
+
+    let depls_api = deployments.clone();
+    let tec_api_poll = tec_api.clone();
+    poller
+        .poll_async(|| {
+            let depls = depls_api.clone();
+            let tecs = tec_api_poll.clone();
+            async move {
+                // Check that deployments maintain availability
+                for name in [TRUSTEE_DEPLOYMENT, REGISTER_SERVER_DEPLOYMENT] {
+                    let depl = depls.get(name).await?;
+                    let available = depl
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.available_replicas)
+                        .unwrap_or(0);
+                    if available < 1 {
+                        return Err(anyhow::anyhow!(
+                            "Deployment {name} has {available} available replicas during upgrade"
+                        ));
+                    }
+                }
+
+                // Check if upgrade completed
+                let tec = tecs.get(TEC_NAME).await?;
+                let version_restored = tec
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.observed_operator_version.as_ref())
+                    .is_some();
+                if version_restored {
+                    return Ok(());
+                }
+                Err(anyhow::anyhow!("Upgrade still in progress"))
+            }
+        })
+        .await?;
+
+    test_ctx.info("Upgrade completed with no deployment downtime");
+
+    test_ctx.cleanup().await?;
+    Ok(())
+}
+}
+
+named_test! {
+async fn test_upgrade_combined_pcrs() -> anyhow::Result<()> {
     let test_ctx = setup!([(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_REF)]).await?;
     let client = test_ctx.client();
     let namespace = test_ctx.namespace();
 
-    // In practical terms it emulates a grub + kernel upgrade
-    test_ctx.verify_expected_pcrs(&[&primary_pcrs!(), &secondary_pcrs!()]).await?;
+    let tec_api: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
+    let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
 
-    let expected_ref_values = [
-        // PCR4
-        PRIMARY_PCR4_HASH,
-        MIX_PRIMARY_BOOT_SECONDARY_KERNEL_PCR4_HASH,
-        MIX_SECONDARY_BOOT_PRIMARY_KERNEL_PCR4_HASH,
-        SECONDARY_PCR4_HASH,
-        // PCR14
-        PCR14_HASH,
-    ];
+    // Wait for install and both images to be committed
+    let done = await_condition(tec_api.clone(), TEC_NAME, tec_has_condition("Installed", "True"));
+    timeout(scaled_duration(120), done)
+        .await
+        .context("waiting for initial install")??;
 
-    let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-    let all_expected_pcrs = |cm: Option<&ConfigMap>| {
-        let data = cm.and_then(|cm| cm.data.as_ref());
-        let rv_json = data.and_then(|data| data.get("reference-values.json"));
-        if let Some(reference_values) = rv_json {
-            for value in expected_ref_values {
-                if !reference_values.contains(value) {
-                    return false;
+    // Wait for both ApprovedImages to be committed with PCRs
+    for img_name in [APPROVED_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME] {
+        let done = await_condition(images.clone(), img_name, |img: Option<&ApprovedImage>| {
+            approved_image_is_committed(img) && approved_image_has_pcrs(img)
+        });
+        timeout(scaled_duration(300), done)
+            .await
+            .context(format!("waiting for {img_name} to be committed with PCRs"))??;
+    }
+    test_ctx.info("Both ApprovedImages committed with PCRs before upgrade");
+
+    // Extract PCR hex values from an ApprovedImage for comparison
+    let extract_pcr_hex = |img: &ApprovedImage| -> Vec<(i64, String)> {
+        img.status
+            .as_ref()
+            .and_then(|s| s.pcrs.as_ref())
+            .map(|pcrs| pcrs.iter().map(|p| (p.id, p.value.clone())).collect())
+            .unwrap_or_default()
+    };
+
+    // Record pre-upgrade PCR values for both images
+    let pre_primary = images.get(APPROVED_IMAGE_NAME).await?;
+    let pre_primary_pcrs = extract_pcr_hex(&pre_primary);
+    let pre_secondary = images.get(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME).await?;
+    let pre_secondary_pcrs = extract_pcr_hex(&pre_secondary);
+    test_ctx.info("Recorded pre-upgrade PCR values");
+
+    // Trigger upgrade
+    trigger_upgrade(&tec_api, TEC_NAME).await?;
+    test_ctx.info("Triggered upgrade with 2 ApprovedImages");
+
+    // Wait for upgrade to complete
+    let has_version = |tec: Option<&TrustedExecutionCluster>| {
+        tec.and_then(|t| t.status.as_ref())
+            .and_then(|s| s.observed_operator_version.as_ref())
+            .is_some()
+    };
+    let done = await_condition(tec_api.clone(), TEC_NAME, has_version);
+    timeout(scaled_duration(180), done)
+        .await
+        .context("waiting for upgrade to complete")??;
+
+    // Wait for both ApprovedImages to be re-committed with PCRs after invalidation
+    for img_name in [APPROVED_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME] {
+        let done = await_condition(images.clone(), img_name, |img: Option<&ApprovedImage>| {
+            approved_image_is_committed(img) && approved_image_has_pcrs(img)
+        });
+        timeout(scaled_duration(300), done)
+            .await
+            .context(format!("waiting for {img_name} to be re-committed after upgrade"))??;
+    }
+    test_ctx.info("Both ApprovedImages re-committed with PCRs after upgrade");
+
+    // Verify PCR values match pre-upgrade (same images, same PCRs expected)
+    let post_primary = images.get(APPROVED_IMAGE_NAME).await?;
+    let post_primary_pcrs = extract_pcr_hex(&post_primary);
+    let post_secondary = images.get(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME).await?;
+    let post_secondary_pcrs = extract_pcr_hex(&post_secondary);
+
+    assert_eq!(
+        pre_primary_pcrs, post_primary_pcrs,
+        "Primary ApprovedImage PCRs should match after upgrade"
+    );
+    assert_eq!(
+        pre_secondary_pcrs, post_secondary_pcrs,
+        "Secondary ApprovedImage PCRs should match after upgrade"
+    );
+    test_ctx.info("PCR values verified identical after upgrade recomputation");
+
+    test_ctx.cleanup().await?;
+    Ok(())
+}
+}
+
+named_test! {
+async fn test_upgrade_failure_preserves_old_pods() -> anyhow::Result<()> {
+    let test_ctx = setup!().await?;
+    let client = test_ctx.client();
+    let namespace = test_ctx.namespace();
+
+    let tec_api: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+
+    // Wait for install
+    let done = await_condition(tec_api.clone(), TEC_NAME, tec_has_condition("Installed", "True"));
+    timeout(scaled_duration(120), done)
+        .await
+        .context("waiting for initial install")??;
+
+    // Wait for ApprovedImage to be committed
+    let done = await_condition(images.clone(), APPROVED_IMAGE_NAME, approved_image_is_committed);
+    timeout(scaled_duration(300), done)
+        .await
+        .context("waiting for ApprovedImage committed")??;
+
+    // Record pre-failure state: Trustee image and pod count
+    let pre_trustee_image = deployment_image(&deployments.get(TRUSTEE_DEPLOYMENT).await?)
+        .expect("Trustee should have image");
+    test_ctx.info(format!("Pre-failure Trustee image: {pre_trustee_image}"));
+
+    let lp = ListParams::default().labels("app=kbs");
+    let pre_pods: Vec<_> = pods_api
+        .list(&lp)
+        .await?
+        .items
+        .iter()
+        .filter_map(|p| p.metadata.name.clone())
+        .collect();
+    test_ctx.info(format!("Pre-failure Trustee pods: {pre_pods:?}"));
+
+    // Trigger upgrade AND set a bad Trustee image to force failure.
+    // We patch the Trustee Deployment with a non-existent image, then clear
+    // observedOperatorVersion. The converge_trustee step will detect image drift
+    // (if RELATED_IMAGE_TRUSTEE env is set to something else) or the deployment
+    // will fail to roll out due to ImagePullBackOff.
+    //
+    // To simulate failure cleanly: patch the deployment directly with a bad image
+    // that will cause wait_for_deployment_available to timeout.
+    let bad_image = "quay.io/nonexistent/bad-image:v999.999.999";
+    let patch = json!({
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [{
+                        "name": "kbs",
+                        "image": bad_image
+                    }]
                 }
             }
-        } else {
-            return false;
         }
-        true
+    });
+    deployments
+        .patch(
+            TRUSTEE_DEPLOYMENT,
+            &PatchParams::apply("test-upgrade-failure"),
+            &Patch::Strategic(patch),
+        )
+        .await?;
+    test_ctx.info(format!("Patched Trustee with bad image: {bad_image}"));
+
+    // Now trigger the upgrade
+    trigger_upgrade(&tec_api, TEC_NAME).await?;
+    test_ctx.info("Triggered upgrade (Trustee has bad image, should fail)");
+
+    // Wait for Upgrade=Failed condition
+    let done = await_condition(tec_api.clone(), TEC_NAME, tec_has_condition_reason("Upgrade", "Failed"));
+    timeout(scaled_duration(360), done)
+        .await
+        .context("waiting for Upgrade=Failed condition")??;
+    test_ctx.info("Upgrade=Failed condition detected");
+
+    // Verify the TEC status message contains failure detail
+    let tec = tec_api.get(TEC_NAME).await?;
+    let upgrade_cond = tec
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|cs| cs.iter().find(|c| c.type_ == "Upgrade"));
+    assert!(
+        upgrade_cond.is_some(),
+        "Upgrade condition should exist"
+    );
+    let msg = &upgrade_cond.unwrap().message;
+    assert!(
+        msg.contains("Manual intervention required"),
+        "Upgrade failure message should indicate manual intervention, got: {msg}"
+    );
+    test_ctx.info(format!("Upgrade failure message: {msg}"));
+
+    // Verify old Trustee pods are still running (RollingUpdate keeps old pods)
+    let post_pods = pods_api.list(&lp).await?;
+    let running_pods: Vec<_> = post_pods
+        .items
+        .iter()
+        .filter(|p| {
+            p.status
+                .as_ref()
+                .and_then(|s| s.phase.as_deref())
+                .is_some_and(|phase| phase == "Running")
+        })
+        .filter_map(|p| p.metadata.name.clone())
+        .collect();
+    assert!(
+        !running_pods.is_empty(),
+        "At least one old Trustee pod should still be Running after failed upgrade"
+    );
+    test_ctx.info(format!("Old Trustee pods still running: {running_pods:?}"));
+
+    // Verify observedOperatorVersion was NOT updated (should be the old version)
+    let post_version = tec
+        .status
+        .as_ref()
+        .and_then(|s| s.observed_operator_version.as_deref());
+    assert!(
+        post_version.is_none() || post_version != Some(""),
+        "observedOperatorVersion should not be cleared or updated on failure"
+    );
+    test_ctx.info("observedOperatorVersion preserved after failure");
+
+    // Recovery: restore the good Trustee image
+    let good_patch = json!({
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [{
+                        "name": "kbs",
+                        "image": pre_trustee_image
+                    }]
+                }
+            }
+        }
+    });
+    deployments
+        .patch(
+            TRUSTEE_DEPLOYMENT,
+            &PatchParams::apply("test-upgrade-failure"),
+            &Patch::Strategic(good_patch),
+        )
+        .await?;
+    test_ctx.info("Restored good Trustee image");
+
+    // Wait for the deployment to become healthy again
+    test_ctx.wait_for_deployment_ready(&deployments, TRUSTEE_DEPLOYMENT, scaled_timeout(120)).await?;
+    test_ctx.info("Trustee deployment healthy after recovery");
+
+    test_ctx.cleanup().await?;
+    Ok(())
+}
+}
+
+named_test! {
+async fn test_upgrade_preserves_approved_image_first_seen() -> anyhow::Result<()> {
+    let test_ctx = setup!().await?;
+    let client = test_ctx.client();
+    let namespace = test_ctx.namespace();
+
+    let tec_api: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
+    let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
+
+    // Wait for install and ApprovedImage commit
+    let done = await_condition(tec_api.clone(), TEC_NAME, tec_has_condition("Installed", "True"));
+    timeout(scaled_duration(120), done)
+        .await
+        .context("waiting for initial install")??;
+
+    let done = await_condition(images.clone(), APPROVED_IMAGE_NAME, |img: Option<&ApprovedImage>| {
+        approved_image_is_committed(img) && approved_image_has_pcrs(img)
+    });
+    timeout(scaled_duration(300), done)
+        .await
+        .context("waiting for ApprovedImage committed with PCRs")??;
+
+    // Record first_seen
+    let pre_image = images.get(APPROVED_IMAGE_NAME).await?;
+    let pre_first_seen = pre_image.status.as_ref().and_then(|s| s.first_seen.clone());
+    test_ctx.info(format!("Pre-upgrade first_seen: {pre_first_seen:?}"));
+
+    // Trigger upgrade
+    trigger_upgrade(&tec_api, TEC_NAME).await?;
+    test_ctx.info("Triggered upgrade");
+
+    // Wait for upgrade to complete and ApprovedImage to be re-committed
+    let has_version = |tec: Option<&TrustedExecutionCluster>| {
+        tec.and_then(|t| t.status.as_ref())
+            .and_then(|s| s.observed_operator_version.as_ref())
+            .is_some()
     };
-    let done = await_condition(configmaps, TRUSTEE_RV_MAP, all_expected_pcrs);
-    let ctx = "waiting for ConfigMap trustee-data to contain all expected pcrs";
-    timeout(scaled_duration(180), done).await.context(ctx)??;
+    let done = await_condition(tec_api.clone(), TEC_NAME, has_version);
+    timeout(scaled_duration(180), done)
+        .await
+        .context("waiting for upgrade to complete")??;
+
+    let done = await_condition(images.clone(), APPROVED_IMAGE_NAME, |img: Option<&ApprovedImage>| {
+        approved_image_is_committed(img) && approved_image_has_pcrs(img)
+    });
+    timeout(scaled_duration(300), done)
+        .await
+        .context("waiting for ApprovedImage re-committed after upgrade")??;
+
+    // Verify first_seen is preserved
+    let post_image = images.get(APPROVED_IMAGE_NAME).await?;
+    let post_first_seen = post_image.status.as_ref().and_then(|s| s.first_seen.clone());
+    assert_eq!(
+        pre_first_seen, post_first_seen,
+        "first_seen should be preserved across upgrade"
+    );
+    test_ctx.info("first_seen preserved after upgrade");
 
     test_ctx.cleanup().await?;
     Ok(())

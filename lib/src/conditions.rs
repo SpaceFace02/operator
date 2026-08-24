@@ -22,3 +22,11 @@ pub const NOT_COMMITTED_REASON_PENDING: &str = "PodPending";
 pub const ATTESTATION_KEY_APPROVED_CONDITION: &str = "Approved";
 pub const ATTESTATION_KEY_REGISTRATION_REASON: &str = "Registration";
 pub const ATTESTATION_KEY_MACHINE_APPROVE: &str = "MachineCreated";
+
+pub const UPGRADE_CONDITION: &str = "Upgrade";
+pub const UPGRADE_IN_PROGRESS: &str = "InProgress";
+pub const UPGRADE_COMPLETE: &str = "Complete";
+pub const UPGRADE_FAILED: &str = "Failed";
+
+pub const TRUSTEE_UPGRADE_CONDITION: &str = "TrusteeUpgrade";
+pub const RELATED_IMAGES_UPGRADE_CONDITION: &str = "RelatedImagesUpgrade";

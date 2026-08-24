@@ -260,7 +260,10 @@ attestation-tests: generate trusted-cluster-gen crds-rs
 trusted-execution-cluster-tests: generate trusted-cluster-gen crds-rs
 	$(INTEGRATION_TEST_ENV) cargo test --test trusted_execution_cluster $(INTEGRATION_TEST_FLAGS)
 
-integration-tests: attestation-tests trusted-execution-cluster-tests
+upgrade-tests: generate trusted-cluster-gen crds-rs
+	$(INTEGRATION_TEST_ENV) cargo test --test upgrade $(INTEGRATION_TEST_FLAGS)
+
+integration-tests: attestation-tests trusted-execution-cluster-tests upgrade-tests
 
 $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
