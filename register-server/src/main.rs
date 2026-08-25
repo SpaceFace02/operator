@@ -16,16 +16,18 @@ use env_logger::Env;
 use ignition_config::v3_6::{
     Clevis, ClevisCustom, Config as IgnitionConfig, Filesystem, Luks, Storage,
 };
+use k8s_openapi::api::core::v1::ObjectReference;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
-use kube::{Api, Client};
+use kube::runtime::events::{EventType, Recorder, Reporter};
+use kube::{Api, Client, Resource};
 use log::{error, info};
 use std::net::SocketAddr;
 use uuid::Uuid;
 
 use trusted_cluster_operator_lib::endpoints::*;
 use trusted_cluster_operator_lib::{
-    generate_owner_reference, get_trusted_execution_cluster, Machine, MachineSpec,
+    generate_owner_reference, get_trusted_execution_cluster, record_event, Machine, MachineSpec,
 };
 
 /// Allow for an operator::KUBE_READ_TIMEOUT to hit (5 minutes) plus one minute,
@@ -44,6 +46,12 @@ struct Args {
 
     #[arg(long)]
     key_path: Option<String>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    client: Client,
+    recorder: Recorder,
 }
 
 /// Information about endpoints for clevis configuration
@@ -168,8 +176,10 @@ fn generate_ignition(id: &str, endpoint_info: &EndpointInfo) -> IgnitionConfig {
     }
 }
 
-async fn register_handler(State(kube_client): State<Client>) -> impl IntoResponse {
+async fn register_handler(State(state): State<AppState>) -> impl IntoResponse {
     let id = Uuid::new_v4().to_string();
+    let kube_client = state.client;
+    let recorder = state.recorder;
     let internal_error = |e: anyhow::Error| {
         let code = StatusCode::INTERNAL_SERVER_ERROR;
         error!("{e:?}");
@@ -192,7 +202,20 @@ async fn register_handler(State(kube_client): State<Client>) -> impl IntoRespons
     };
 
     match create_machine(kube_client.clone(), &id, owner_reference).await {
-        Ok(_) => info!("Machine created successfully: machine-{id}"),
+        Ok(machine) => {
+            let machine_ref: ObjectReference = machine.object_ref(&());
+            info!("Machine created successfully: machine-{id}");
+            record_event(
+                &recorder,
+                &machine_ref,
+                EventType::Normal,
+                "MachineRegistered",
+                format!("Machine machine-{id} registered"),
+                "Registering",
+                None,
+            )
+            .await;
+        }
         Err(e) => return internal_error(e.context("Failed to create machine")),
     }
     let endpoint_info = match EndpointInfo::create(kube_client).await {
@@ -213,7 +236,7 @@ async fn create_machine(
     client: Client,
     uuid: &str,
     owner_reference: OwnerReference,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Machine> {
     let machine_name = format!("machine-{uuid}");
     let machine = Machine {
         metadata: ObjectMeta {
@@ -228,9 +251,9 @@ async fn create_machine(
     };
 
     let machines: Api<Machine> = Api::default_namespaced(client);
-    machines.create(&Default::default(), &machine).await?;
+    let created = machines.create(&Default::default(), &machine).await?;
     info!("Created Machine: {machine_name} with UUID: {uuid}");
-    Ok(())
+    Ok(created)
 }
 
 #[tokio::main]
@@ -240,9 +263,18 @@ async fn main() {
     let args = Args::parse();
     let endpoint = format!("/{REGISTER_SERVER_RESOURCE}");
     let err = "failed to create Kubernetes client";
+    let client = Client::try_default().await.expect(err);
+    let reporter = Reporter {
+        controller: "register-server".into(),
+        instance: std::env::var("CONTROLLER_POD_NAME").ok(),
+    };
+    let state = AppState {
+        recorder: Recorder::new(client.clone(), reporter),
+        client,
+    };
     let app = Router::new()
         .route(&endpoint, get(register_handler))
-        .with_state(Client::try_default().await.expect(err));
+        .with_state(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
     let service = app.into_make_service();
 
@@ -362,9 +394,10 @@ mod tests {
     async fn test_create_machine() {
         let clos = async |_, _| Ok(serde_json::to_string(&dummy_machine()).unwrap());
         count_check!(1, clos, |client| {
-            assert!(create_machine(client, "test", dummy_owner_reference())
+            let machine = create_machine(client, "test", dummy_owner_reference())
                 .await
-                .is_ok());
+                .unwrap();
+            assert_eq!(machine.metadata.name, Some("test".to_string()));
         });
     }
 

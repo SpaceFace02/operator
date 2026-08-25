@@ -6,6 +6,7 @@
 use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+use k8s_openapi::api::core::v1::ObjectReference;
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, PodSpec, PodTemplateSpec, Service, ServicePort, ServiceSpec,
 };
@@ -15,6 +16,7 @@ use k8s_openapi::apimachinery::pkg::{
 };
 use kube::runtime::{
     controller::{Action, Controller},
+    events::EventType,
     finalizer,
     finalizer::Event,
     reflector::ObjectRef,
@@ -26,7 +28,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use crate::conditions::machine_key_provisioned_condition;
 use crate::trustee;
 use operator::*;
-use trusted_cluster_operator_lib::{Machine, endpoints::*};
+use trusted_cluster_operator_lib::{Machine, endpoints::*, record_event};
 
 /// Finalizer name to discard decryption keys when a machine is deleted
 const MACHINE_FINALIZER: &str = "finalizer.machine.trusted-execution-clusters.io";
@@ -132,14 +134,16 @@ async fn keygen_reconcile(
     ctx: Arc<OperatorContext>,
 ) -> Result<Action, ControllerError> {
     let machines: Api<Machine> = Api::default_namespaced(ctx.client.clone());
+    let recorder = ctx.recorder.clone();
     finalizer(&machines, MACHINE_FINALIZER, machine, |ev| async move {
         match ev {
             Event::Apply(machine) => {
+                let machine_ref: ObjectReference = machine.object_ref(&());
                 let id = machine.spec.id.clone();
                 let machine_name = machine.metadata.name.clone().unwrap_or_default();
                 let generation = machine.metadata.generation;
                 let existing_status = machine.status.clone();
-                async {
+                let result = async {
                     let owner_reference = generate_owner_reference(&Arc::unwrap_or_clone(machine))?;
                     let provisioning_result = async {
                         trustee::generate_secret(ctx.client.clone(), &id, owner_reference).await?;
@@ -164,11 +168,36 @@ async fn keygen_reconcile(
                     provisioning_result?;
                     Ok::<(), anyhow::Error>(())
                 }
-                .await
-                .map(|_| LONG_REQUEUE)
-                .map_err(|e| finalizer::Error::<ControllerError>::ApplyFailed(e.into()))
+                .await;
+                if result.is_ok() {
+                    record_event(
+                        &recorder,
+                        &machine_ref,
+                        EventType::Normal,
+                        "KeyProvisioned",
+                        format!("Decryption key provisioned for machine {id}"),
+                        "Provisioning",
+                        None,
+                    )
+                    .await;
+                } else {
+                    record_event(
+                        &recorder,
+                        &machine_ref,
+                        EventType::Warning,
+                        "KeyProvisioningFailed",
+                        format!("Failed to provision decryption key for machine {id}"),
+                        "Provisioning",
+                        None,
+                    )
+                    .await;
+                }
+                result
+                    .map(|_| LONG_REQUEUE)
+                    .map_err(|e| finalizer::Error::<ControllerError>::ApplyFailed(e.into()))
             }
             Event::Cleanup(machine) => {
+                let machine_ref: ObjectReference = machine.object_ref(&());
                 let id = &machine.spec.id;
 
                 // Check if the TrustedExecutionCluster is being deleted
@@ -202,8 +231,20 @@ async fn keygen_reconcile(
                         }
                     }
                 }
-                trustee::delete_secret(&ctx, id)
-                    .await
+                let result = trustee::delete_secret(&ctx, id).await;
+                if result.is_ok() {
+                    record_event(
+                        &recorder,
+                        &machine_ref,
+                        EventType::Normal,
+                        "KeyRevoked",
+                        format!("Decryption key revoked for machine {id}"),
+                        "Revoking",
+                        None,
+                    )
+                    .await;
+                }
+                result
                     .map(|_| LONG_REQUEUE)
                     .map_err(|e| finalizer::Error::<ControllerError>::CleanupFailed(e.into()))
             }

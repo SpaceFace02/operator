@@ -25,7 +25,9 @@ pub use vendor_kopium::virtualmachines;
 
 use anyhow::{Context, Result, anyhow};
 use conditions::*;
+use k8s_openapi::api::core::v1::ObjectReference;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, OwnerReference, Time};
+use kube::runtime::events::{Event as K8sEvent, EventType, Recorder};
 use kube::{Api, Client, Resource};
 
 #[macro_export]
@@ -109,6 +111,27 @@ pub fn committed_condition(
         last_transition_time: transition_time(existing_status, type_, &status),
         status,
         observed_generation: generation,
+    }
+}
+
+pub async fn record_event(
+    recorder: &Recorder,
+    reference: &ObjectReference,
+    type_: EventType,
+    reason: &str,
+    note: String,
+    action: &str,
+    secondary: Option<ObjectReference>,
+) {
+    let ev = K8sEvent {
+        type_,
+        reason: reason.into(),
+        note: Some(note),
+        action: action.into(),
+        secondary,
+    };
+    if let Err(e) = recorder.publish(&ev, reference).await {
+        log::warn!("Failed to publish event: {e}");
     }
 }
 
