@@ -12,8 +12,9 @@ use k8s_openapi::api::core::v1::{
     ConfigMap, LoadBalancerStatus, Namespace, Secret, Service, ServicePort, ServiceSpec,
     ServiceStatus,
 };
+use k8s_openapi::api::events::v1::Event;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
-use kube::api::{DeleteParams, ObjectMeta, Patch};
+use kube::api::{DeleteParams, ListParams, ObjectMeta, Patch};
 use kube::runtime::wait::await_condition;
 use kube::{Api, Client};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -1182,4 +1183,40 @@ where
     let duration = Duration::from_secs(timeout_secs);
     timeout(duration, done).await.context(ctx)??;
     Ok(())
+}
+
+pub async fn wait_for_event(
+    client: &Client,
+    namespace: &str,
+    regarding_name: &str,
+    reason: &str,
+    timeout_secs: u64,
+) -> Result<Event> {
+    let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
+    Poller::new()
+        .with_timeout(Duration::from_secs(timeout_secs))
+        .with_error_message(format!(
+            "waiting for event reason='{reason}' regarding='{regarding_name}'"
+        ))
+        .poll_async(|| {
+            let api = events_api.clone();
+            let name = regarding_name.to_string();
+            let rsn = reason.to_string();
+            async move {
+                let list = api.list(&ListParams::default()).await?;
+                list.items
+                    .into_iter()
+                    .find(|e| {
+                        let name_match = e
+                            .regarding
+                            .as_ref()
+                            .and_then(|r| r.name.as_ref())
+                            .is_some_and(|n| n == &name);
+                        let reason_match = e.reason.as_deref() == Some(&rsn);
+                        name_match && reason_match
+                    })
+                    .ok_or_else(|| anyhow!("not found yet"))
+            }
+        })
+        .await
 }
