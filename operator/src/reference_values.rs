@@ -35,6 +35,9 @@ use trusted_cluster_operator_lib::{conditions::*, reference_values::*, *};
 const JOB_LABEL_KEY: &str = "kind";
 const APPROVED_IMAGE_ANNOTATION: &str = "approved-image";
 const PCR_COMMAND_NAME: &str = "compute-pcrs";
+/// Requeue while PCR Jobs are in flight or being replaced after invalidation.
+/// A 1h requeue would miss Job deletion after upgrade invalidation.
+const PCR_COMPUTING_REQUEUE: Duration = Duration::from_secs(30);
 const PCR_LABEL: &str = "org.coreos.pcrs";
 /// Finalizer name to discard reference values when an image is no longer approved
 const APPROVED_IMAGE_FINALIZER: &str = "finalizer.approved-image.trusted-execution-clusters.io";
@@ -123,6 +126,21 @@ pub async fn launch_rv_job_controller(client: Client) {
             .run(job_reconcile, controller_error_policy, Arc::new(client))
             .for_each(controller_info),
     );
+}
+
+/// Deletes the compute-pcrs Job for `boot_image` so a later reconcile can
+/// recreate it. 404 is success: the Job may already have been collected.
+pub(crate) async fn delete_compute_pcrs_job(client: &Client, boot_image: &str) -> Result<()> {
+    let job_name = get_job_name(boot_image)?;
+    let jobs: Api<Job> = Api::default_namespaced(client.clone());
+    match jobs.delete(&job_name, &DeleteParams::foreground()).await {
+        Ok(_) => info!("Deleted Job {job_name} for PCR recomputation"),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            info!("Job {job_name} already absent");
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
 }
 
 // Name job by sanitized image name, plus a hash to disambiguate
@@ -274,6 +292,10 @@ async fn image_add_reconcile(
         return Ok(Action::requeue(Duration::from_secs(5)));
     }
     let (action, reason) = match handle_new_image(client.clone(), image).await {
+        Ok(NOT_COMMITTED_REASON_COMPUTING) => (
+            Action::requeue(PCR_COMPUTING_REQUEUE),
+            NOT_COMMITTED_REASON_COMPUTING,
+        ),
         Ok(reason) => (LONG_REQUEUE, reason),
         Err(e) => {
             warn!("PCR computation for {name} failed: {e}");
@@ -520,6 +542,19 @@ mod tests {
             name,
             "compute-pcrs-6c57e93939-quay-io-some-ref-sha256-e71dad00aa0e3d7"
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_compute_pcrs_job_not_found() {
+        let clos = async |req: Request<_>, _| {
+            assert_eq!(req.method(), &Method::DELETE);
+            Err(StatusCode::NOT_FOUND)
+        };
+        count_check!(1, clos, |client| {
+            delete_compute_pcrs_job(&client, DUMMY_IMAGE_REF)
+                .await
+                .unwrap();
+        });
     }
 
     #[tokio::test]

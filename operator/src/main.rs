@@ -154,6 +154,16 @@ async fn reconcile(
             return Ok(LONG_REQUEUE);
         }
 
+        // A previous upgrade failed and requires manual intervention;
+        // do not retry automatically.
+        // TODO: Add a retry count before giving up and requiring manual intervention.
+        let has_failed = conditions
+            .as_ref()
+            .is_some_and(|cs| cs.iter().any(|c| c.type_ == UPGRADE_CONDITION && c.reason == UPGRADE_FAILED));
+        if has_failed {
+            return Ok(LONG_REQUEUE);
+        }
+
         // upgrade branch
         info!("Upgrading TrustedExecutionCluster {name} from {observed:?} to {COMPONENT_VERSION}");
         let upgrade_cond = upgrade_condition(
@@ -263,6 +273,9 @@ async fn invalidate_all_approved_images(client: &Client) -> Result<()> {
             Some(n) => n.clone(),
             None => continue,
         };
+        reference_values::delete_compute_pcrs_job(client, &image.spec.image)
+            .await
+            .context("Failed to delete compute-pcrs Job before PCR recomputation")?;
         // Setting the not committed condition to trigger PCR recomputation.
         let not_committed = committed_condition(
             NOT_COMMITTED_REASON_COMPUTING,
@@ -316,35 +329,32 @@ async fn run_upgrade(
     Ok(())
 }
 
-/// Waits for a Deployment rollout to complete: the Deployment controller must
-/// have observed the latest spec (`observedGeneration >= generation`), at least
-/// one replica must be available, and the `Available` condition must be `True`.
-/// This ensures the NEW pod is running, not just the old one during a
-/// RollingUpdate.
+/// True when the Deployment's desired generation is fully rolled out: the
+/// controller has observed the spec, no old replicas remain, and every updated
+/// replica is available. Checking only `availableReplicas >= 1` would treat a
+/// RollingUpdate with a stuck new pod (and a still-ready old pod) as complete.
+fn deployment_rollout_complete(depl: &Deployment) -> bool {
+    let Some(status) = depl.status.as_ref() else {
+        return false;
+    };
+    let generation_seen =
+        status.observed_generation.unwrap_or(0) >= depl.metadata.generation.unwrap_or(0);
+    let desired = depl.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+    let replicas = status.replicas.unwrap_or(0);
+    let updated = status.updated_replicas.unwrap_or(0);
+    let available = status.available_replicas.unwrap_or(0);
+    generation_seen && updated >= desired && replicas <= updated && available >= updated
+}
+
 async fn wait_for_deployment_available(client: &Client, name: &str) -> Result<()> {
     use kube::runtime::wait::await_condition;
     use tokio::time::timeout;
 
     let deployments: Api<Deployment> = Api::default_namespaced(client.clone());
-    let is_rollout_complete = |d: Option<&Deployment>| -> bool {
-        let Some(depl) = d else { return false };
-        let Some(status) = depl.status.as_ref() else { return false };
-        let generation_seen = status
-            .observed_generation
-            .unwrap_or(0)
-            >= depl.metadata.generation.unwrap_or(0);
-        let has_replicas = status.available_replicas.unwrap_or(0) >= 1;
-        let has_condition = status
-            .conditions
-            .as_ref()
-            .is_some_and(|cs| {
-                cs.iter()
-                    .any(|c| c.type_ == "Available" && c.status == "True")
-            });
-        generation_seen && has_replicas && has_condition
-    };
     info!("Waiting for Deployment {name} rollout to complete...");
-    let done = await_condition(deployments, name, is_rollout_complete);
+    let done = await_condition(deployments, name, |d: Option<&Deployment>| {
+        d.is_some_and(deployment_rollout_complete)
+    });
     timeout(DEPLOYMENT_READY_TIMEOUT, done)
         .await
         .context(format!(
@@ -693,6 +703,57 @@ mod tests {
         }
     }
 
+    fn deployment_with_rollout(
+        generation: i64,
+        observed: i64,
+        spec_replicas: i32,
+        replicas: i32,
+        updated: i32,
+        available: i32,
+    ) -> Deployment {
+        use k8s_openapi::api::apps::v1::DeploymentStatus;
+        let mut depl = make_deployment("trustee-deployment", "img");
+        depl.metadata.generation = Some(generation);
+        depl.spec.as_mut().unwrap().replicas = Some(spec_replicas);
+        depl.status = Some(DeploymentStatus {
+            observed_generation: Some(observed),
+            replicas: Some(replicas),
+            updated_replicas: Some(updated),
+            available_replicas: Some(available),
+            ..Default::default()
+        });
+        depl
+    }
+
+    #[test]
+    fn test_deployment_rollout_complete() {
+        assert!(deployment_rollout_complete(&deployment_with_rollout(
+            2, 2, 1, 1, 1, 1
+        )));
+    }
+
+    #[test]
+    fn test_deployment_rollout_incomplete_old_replica() {
+        // RollingUpdate: new pod stuck, old pod still available.
+        assert!(!deployment_rollout_complete(&deployment_with_rollout(
+            2, 2, 1, 2, 1, 1
+        )));
+    }
+
+    #[test]
+    fn test_deployment_rollout_incomplete_new_unready() {
+        assert!(!deployment_rollout_complete(&deployment_with_rollout(
+            2, 2, 1, 1, 1, 0
+        )));
+    }
+
+    #[test]
+    fn test_deployment_rollout_incomplete_generation() {
+        assert!(!deployment_rollout_complete(&deployment_with_rollout(
+            2, 1, 1, 1, 1, 1
+        )));
+    }
+
     fn dummy_cluster_ctx(client: Client) -> ClusterContext {
         ClusterContext {
             client,
@@ -945,7 +1006,6 @@ mod tests {
         });
     }
 
-
     // Tests the installed condition is set to True when the operator version is the same as the component version.
     #[tokio::test]
     async fn test_reconcile_installed_same_version_returns_long_requeue() {
@@ -1060,7 +1120,6 @@ mod tests {
         });
     }
 
-
     fn mock_approved_image(name: &str, with_first_seen: bool) -> ApprovedImage {
         ApprovedImage {
             metadata: kube::api::ObjectMeta {
@@ -1104,7 +1163,8 @@ mod tests {
                     };
                     Ok(serde_json::to_string(&list).unwrap())
                 }
-                (1, &Method::PATCH) => {
+                (1, &Method::DELETE) => Err(StatusCode::NOT_FOUND),
+                (2, &Method::PATCH) => {
                     let body = get_body_string(req).await;
                     assert!(
                         body.contains(NOT_COMMITTED_REASON_COMPUTING),
@@ -1123,7 +1183,7 @@ mod tests {
             }
         };
 
-        count_check!(2, clos, |client| {
+        count_check!(3, clos, |client| {
             invalidate_all_approved_images(&client)
                 .await
                 .expect("invalidate should succeed");

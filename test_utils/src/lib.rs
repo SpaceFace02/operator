@@ -9,10 +9,10 @@ use fs_extra::dir;
 use glob::glob;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{
-    LoadBalancerStatus, Namespace, Secret, Service, ServicePort, ServiceSpec, ServiceStatus,
+    LoadBalancerStatus, Namespace, Pod, Secret, Service, ServicePort, ServiceSpec, ServiceStatus,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
-use kube::api::{DeleteParams, ObjectMeta, Patch};
+use kube::api::{DeleteParams, ListParams, ObjectMeta, Patch, PatchParams};
 use kube::runtime::wait::await_condition;
 use kube::{Api, Client};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -61,6 +61,7 @@ const ATT_REG_SECRET: &str = "att-reg-secret";
 const REG_CERT: &str = "reg-srv-cert";
 const TRUSTEE_CERT: &str = "trustee-cert";
 const ATT_REG_CERT: &str = "att-reg-cert";
+pub const OPERATOR_DEPLOYMENT: &str = "trusted-cluster-operator";
 
 pub fn compare_pcrs(actual: &[Pcr], expected: &[Pcr]) -> bool {
     if actual.len() != expected.len() {
@@ -74,6 +75,22 @@ pub fn compare_pcrs(actual: &[Pcr], expected: &[Pcr]) -> bool {
     }
 
     true
+}
+
+/// True when the Deployment's desired generation is fully rolled out: the
+/// controller has observed the spec, no old replicas remain, and every updated
+/// replica is available.
+pub fn deployment_rollout_complete(depl: &Deployment) -> bool {
+    let Some(status) = depl.status.as_ref() else {
+        return false;
+    };
+    let generation_seen =
+        status.observed_generation.unwrap_or(0) >= depl.metadata.generation.unwrap_or(0);
+    let desired = depl.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+    let replicas = status.replicas.unwrap_or(0);
+    let updated = status.updated_replicas.unwrap_or(0);
+    let available = status.available_replicas.unwrap_or(0);
+    generation_seen && updated >= desired && replicas <= updated && available >= updated
 }
 
 fn timeout_multiplier() -> f64 {
@@ -661,6 +678,69 @@ impl TestContext {
             .context(format!(
             "{deployment_name} deployment does not have 1 available replica after {timeout_secs} seconds"
         ))??;
+        Ok(())
+    }
+
+    /// Sets an env var on the operator Deployment, waits for the rollout,
+    /// and waits for the old pod to fully terminate. The old-pod wait
+    /// prevents a race where the terminating pod's kube-rs controller
+    /// could reconcile with stale env vars.
+    pub async fn set_operator_related_image(
+        &self,
+        deployments: &Api<Deployment>,
+        env_name: &str,
+        image: &str,
+    ) -> Result<()> {
+        let patch = json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{
+                            "name": OPERATOR_DEPLOYMENT,
+                            "env": [{
+                                "name": env_name,
+                                "value": image
+                            }]
+                        }]
+                    }
+                }
+            }
+        });
+        deployments
+            .patch(
+                OPERATOR_DEPLOYMENT,
+                &PatchParams::apply("test-utils"),
+                &Patch::Strategic(patch),
+            )
+            .await?;
+        let done = await_condition(
+            deployments.clone(),
+            OPERATOR_DEPLOYMENT,
+            |d: Option<&Deployment>| d.is_some_and(deployment_rollout_complete),
+        );
+        timeout(scaled_duration(120), done)
+            .await
+            .context("waiting for operator related-image env to roll out")??;
+
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), self.namespace());
+        let lp = ListParams::default().labels("app=trusted-cluster-operator");
+        let wait_old = async {
+            loop {
+                let list = pods.list(&lp).await?;
+                let alive = list
+                    .items
+                    .iter()
+                    .filter(|p| p.metadata.deletion_timestamp.is_none())
+                    .count();
+                if alive == 1 && list.items.len() == 1 {
+                    break anyhow::Ok(());
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        };
+        timeout(scaled_duration(60), wait_old)
+            .await
+            .context("old operator pod should terminate after rollout")??;
         Ok(())
     }
 

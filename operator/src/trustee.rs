@@ -805,15 +805,34 @@ mod tests {
         //   3. img1 bootloader + img2 kernel  (cross: rolling upgrade mid-state)
         //   4. img2 bootloader + img1 kernel  (cross: rolling upgrade mid-state)
         let vals_pcr4 = reference_values_from(&result, "tpm_pcr4");
-        assert_eq!(vals_pcr4.len(), 4, "Expected 4 PCR4 combinations, got: {vals_pcr4:?}");
+        assert_eq!(
+            vals_pcr4.len(),
+            4,
+            "Expected 4 PCR4 combinations, got: {vals_pcr4:?}"
+        );
         assert!(vals_pcr4.contains(&dummy_pcr_value(4)));
         assert!(vals_pcr4.contains(&pcr4_other_value));
 
         // Cross-combination: image 1 bootloader (shim=0xaa, grub=0xbb) + image 2 kernel (vmlinuz=0x33)
         let cross_a = Pcr::compile_from(&vec![
-            TPMEvent { name: "shim".into(), pcr: 4, hash: vec![0xaa; 32], id: TPMEventID::Pcr4Shim },
-            TPMEvent { name: "grub".into(), pcr: 4, hash: vec![0xbb; 32], id: TPMEventID::Pcr4Grub },
-            TPMEvent { name: "vmlinuz".into(), pcr: 4, hash: vec![0x33; 32], id: TPMEventID::Pcr4Vmlinuz },
+            TPMEvent {
+                name: "shim".into(),
+                pcr: 4,
+                hash: vec![0xaa; 32],
+                id: TPMEventID::Pcr4Shim,
+            },
+            TPMEvent {
+                name: "grub".into(),
+                pcr: 4,
+                hash: vec![0xbb; 32],
+                id: TPMEventID::Pcr4Grub,
+            },
+            TPMEvent {
+                name: "vmlinuz".into(),
+                pcr: 4,
+                hash: vec![0x33; 32],
+                id: TPMEventID::Pcr4Vmlinuz,
+            },
         ]);
         assert!(
             vals_pcr4.contains(&hex::encode(&cross_a.value)),
@@ -822,9 +841,24 @@ mod tests {
 
         // Cross-combination: image 2 bootloader (shim=0x11, grub=0x22) + image 1 kernel (vmlinuz=0xcc)
         let cross_b = Pcr::compile_from(&vec![
-            TPMEvent { name: "shim".into(), pcr: 4, hash: vec![0x11; 32], id: TPMEventID::Pcr4Shim },
-            TPMEvent { name: "grub".into(), pcr: 4, hash: vec![0x22; 32], id: TPMEventID::Pcr4Grub },
-            TPMEvent { name: "vmlinuz".into(), pcr: 4, hash: vec![0xcc; 32], id: TPMEventID::Pcr4Vmlinuz },
+            TPMEvent {
+                name: "shim".into(),
+                pcr: 4,
+                hash: vec![0x11; 32],
+                id: TPMEventID::Pcr4Shim,
+            },
+            TPMEvent {
+                name: "grub".into(),
+                pcr: 4,
+                hash: vec![0x22; 32],
+                id: TPMEventID::Pcr4Grub,
+            },
+            TPMEvent {
+                name: "vmlinuz".into(),
+                pcr: 4,
+                hash: vec![0xcc; 32],
+                id: TPMEventID::Pcr4Vmlinuz,
+            },
         ]);
         assert!(
             vals_pcr4.contains(&hex::encode(&cross_b.value)),

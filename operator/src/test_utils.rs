@@ -5,8 +5,8 @@
 use crate::trustee;
 use compute_pcrs_lib::Pcr;
 use compute_pcrs_lib::tpmevents::{TPMEvent, TPMEventID};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::ObjectMeta;
 use std::collections::BTreeMap;
 use trusted_cluster_operator_lib::reference_values::pcrs_to_status;

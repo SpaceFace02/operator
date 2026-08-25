@@ -10,10 +10,10 @@ use compute_pcrs_lib::Pcr;
 use compute_pcrs_lib::tpmevents::{TPMEvent, TPMEventID};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, OwnerReference};
 use k8s_openapi::api::core::v1::{Pod, Secret};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta, OwnerReference};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, OwnerReference};
 use kube::api::{ListParams, LogParams, Patch, PatchParams};
 use kube::runtime::wait::await_condition;
 use kube::{Api, api::DeleteParams};
@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use trusted_cluster_operator_lib::conditions::NOT_COMMITTED_REASON_PENDING;
 use trusted_cluster_operator_lib::endpoints::{REGISTER_SERVER_DEPLOYMENT, TRUSTEE_DEPLOYMENT};
+use trusted_cluster_operator_lib::images::RELATED_IMAGE_TRUSTEE;
 use trusted_cluster_operator_lib::{
     ApprovedImage, AttestationKey, Machine, TrustedExecutionCluster, generate_owner_reference,
 };
@@ -825,7 +826,10 @@ async fn test_upgrade_convergence() -> anyhow::Result<()> {
 }
 }
 
-fn tec_has_condition<'a>(type_: &'a str, status: &'a str) -> impl Fn(Option<&TrustedExecutionCluster>) -> bool + 'a {
+fn tec_has_condition<'a>(
+    type_: &'a str,
+    status: &'a str,
+) -> impl Fn(Option<&TrustedExecutionCluster>) -> bool + 'a {
     move |tec: Option<&TrustedExecutionCluster>| {
         tec.and_then(|t| t.status.as_ref())
             .and_then(|s| s.conditions.as_ref())
@@ -833,7 +837,10 @@ fn tec_has_condition<'a>(type_: &'a str, status: &'a str) -> impl Fn(Option<&Tru
     }
 }
 
-fn tec_has_condition_reason<'a>(type_: &'a str, reason: &'a str) -> impl Fn(Option<&TrustedExecutionCluster>) -> bool + 'a {
+fn tec_has_condition_reason<'a>(
+    type_: &'a str,
+    reason: &'a str,
+) -> impl Fn(Option<&TrustedExecutionCluster>) -> bool + 'a {
     move |tec: Option<&TrustedExecutionCluster>| {
         tec.and_then(|t| t.status.as_ref())
             .and_then(|s| s.conditions.as_ref())
@@ -852,7 +859,10 @@ fn deployment_image(depl: &Deployment) -> Option<String> {
 fn approved_image_is_committed(img: Option<&ApprovedImage>) -> bool {
     img.and_then(|i| i.status.as_ref())
         .and_then(|s| s.conditions.as_ref())
-        .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Committed" && c.status == "True"))
+        .is_some_and(|cs| {
+            cs.iter()
+                .any(|c| c.type_ == "Committed" && c.status == "True")
+        })
 }
 
 fn approved_image_has_pcrs(img: Option<&ApprovedImage>) -> bool {
@@ -1169,39 +1179,17 @@ async fn test_upgrade_failure_preserves_old_pods() -> anyhow::Result<()> {
         .collect();
     test_ctx.info(format!("Pre-failure Trustee pods: {pre_pods:?}"));
 
-    // Trigger upgrade AND set a bad Trustee image to force failure.
-    // We patch the Trustee Deployment with a non-existent image, then clear
-    // observedOperatorVersion. The converge_trustee step will detect image drift
-    // (if RELATED_IMAGE_TRUSTEE env is set to something else) or the deployment
-    // will fail to roll out due to ImagePullBackOff.
-    //
-    // To simulate failure cleanly: patch the deployment directly with a bad image
-    // that will cause wait_for_deployment_available to timeout.
+    // Make the operator desire a bad Trustee image, then trigger upgrade.
+    // Patching the live Trustee Deployment is not enough: converge_trustee
+    // treats that as drift against RELATED_IMAGE_TRUSTEE and patches it back.
     let bad_image = "quay.io/nonexistent/bad-image:v999.999.999";
-    let patch = json!({
-        "spec": {
-            "template": {
-                "spec": {
-                    "containers": [{
-                        "name": "kbs",
-                        "image": bad_image
-                    }]
-                }
-            }
-        }
-    });
-    deployments
-        .patch(
-            TRUSTEE_DEPLOYMENT,
-            &PatchParams::apply("test-upgrade-failure"),
-            &Patch::Strategic(patch),
-        )
+    test_ctx
+        .set_operator_related_image(&deployments, RELATED_IMAGE_TRUSTEE, bad_image)
         .await?;
-    test_ctx.info(format!("Patched Trustee with bad image: {bad_image}"));
+    test_ctx.info(format!("Operator RELATED_IMAGE_TRUSTEE set to {bad_image}"));
 
-    // Now trigger the upgrade
     trigger_upgrade(&tec_api, TEC_NAME).await?;
-    test_ctx.info("Triggered upgrade (Trustee has bad image, should fail)");
+    test_ctx.info("Triggered upgrade (Trustee desired image is bad, should fail)");
 
     // Wait for Upgrade=Failed condition
     let done = await_condition(tec_api.clone(), TEC_NAME, tec_has_condition_reason("Upgrade", "Failed"));
@@ -1258,7 +1246,10 @@ async fn test_upgrade_failure_preserves_old_pods() -> anyhow::Result<()> {
     );
     test_ctx.info("observedOperatorVersion preserved after failure");
 
-    // Recovery: restore the good Trustee image
+    // Recovery: restore the operator's desired image, then the live Trustee pod.
+    test_ctx
+        .set_operator_related_image(&deployments, RELATED_IMAGE_TRUSTEE, &pre_trustee_image)
+        .await?;
     let good_patch = json!({
         "spec": {
             "template": {

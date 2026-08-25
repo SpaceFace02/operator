@@ -19,13 +19,13 @@ use serde_json::json;
 use tokio::time::timeout;
 use trusted_cluster_operator_lib::conditions::*;
 use trusted_cluster_operator_lib::endpoints::*;
+use trusted_cluster_operator_lib::images::*;
 use trusted_cluster_operator_lib::{ApprovedImage, TrustedExecutionCluster};
 use trusted_cluster_operator_lib::ApprovedImageStatusPcrsEvents;
 use trusted_cluster_operator_test_utils::constants::*;
 use trusted_cluster_operator_test_utils::virt::{self, VmBackend};
 
 const TEC_NAME: &str = "trusted-execution-cluster";
-const APPROVED_IMAGE_NAME: &str = "coreos";
 
 fn deployment_image(depl: &Deployment) -> Option<String> {
     depl.spec
@@ -143,30 +143,100 @@ fn deployment_generation(depl: &Deployment) -> i64 {
     depl.metadata.generation.unwrap_or(0)
 }
 
-fn deployment_rollout_complete(depl: &Deployment) -> bool {
-    let Some(status) = depl.status.as_ref() else {
-        return false;
-    };
-    let generation_seen = status.observed_generation.unwrap_or(0)
-        >= depl.metadata.generation.unwrap_or(0);
-    let replicas = depl
-        .spec
-        .as_ref()
-        .and_then(|s| s.replicas)
-        .unwrap_or(1);
-    let updated = status.updated_replicas.unwrap_or(0) >= replicas;
-    let available = status.available_replicas.unwrap_or(0) >= 1;
-    generation_seen && updated && available
+const DRIFTED_TAG: &str = "drifted";
+
+fn registry() -> String {
+    std::env::var("REGISTRY").unwrap_or_else(|_| "localhost:5000".to_string())
+}
+
+fn tag() -> String {
+    std::env::var("TAG").unwrap_or_else(|_| "latest".to_string())
+}
+
+struct DriftedImages {
+    operator: String,
+    reg_server: String,
+    ak_register: String,
+    compute_pcrs: String,
+}
+
+impl DriftedImages {
+    fn new(registry: &str) -> Self {
+        Self {
+            operator: format!("{registry}/trusted-cluster-operator:{DRIFTED_TAG}"),
+            reg_server: format!("{registry}/registration-server:{DRIFTED_TAG}"),
+            ak_register: format!("{registry}/attestation-key-register:{DRIFTED_TAG}"),
+            compute_pcrs: format!("{registry}/compute-pcrs:{DRIFTED_TAG}"),
+        }
+    }
+}
+
+/// Re-tags all component images from `:tag` to `:drifted` and pushes them
+/// to the local registry.
+async fn push_drifted_images(registry: &str, tag: &str) -> anyhow::Result<DriftedImages> {
+    let cli = std::env::var("CONTAINER_CLI").unwrap_or_else(|_| "podman".to_string());
+    let names = [
+        "trusted-cluster-operator",
+        "registration-server",
+        "attestation-key-register",
+        "compute-pcrs",
+    ];
+    for name in names {
+        let src = format!("{registry}/{name}:{tag}");
+        let dst = format!("{registry}/{name}:{DRIFTED_TAG}");
+        let out = tokio::process::Command::new(&cli)
+            .args(["tag", &src, &dst])
+            .output()
+            .await
+            .context(format!("failed to tag {name}"))?;
+        anyhow::ensure!(out.status.success(), "tag {name} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = tokio::process::Command::new(&cli)
+            .args(["push", &dst, "--tls-verify=false"])
+            .output()
+            .await
+            .context(format!("failed to push {name}"))?;
+        anyhow::ensure!(out.status.success(), "push {name} failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(DriftedImages::new(registry))
+}
+
+/// Sets process env vars so that `setup!()` deploys with the drifted images.
+fn set_drifted_env(drifted: &DriftedImages) {
+    unsafe {
+        std::env::set_var("OPERATOR_IMAGE", &drifted.operator);
+        std::env::set_var(RELATED_IMAGE_REGISTRATION_SERVER, &drifted.reg_server);
+        std::env::set_var(RELATED_IMAGE_ATTESTATION_KEY_REGISTER, &drifted.ak_register);
+        std::env::set_var(RELATED_IMAGE_COMPUTE_PCRS, &drifted.compute_pcrs);
+    }
+}
+
+/// Restores process env vars to the current (:latest) images.
+fn restore_current_env(registry: &str, tag: &str) {
+    unsafe {
+        std::env::set_var("OPERATOR_IMAGE", format!("{registry}/trusted-cluster-operator:{tag}"));
+        std::env::set_var(RELATED_IMAGE_REGISTRATION_SERVER, format!("{registry}/registration-server:{tag}"));
+        std::env::set_var(RELATED_IMAGE_ATTESTATION_KEY_REGISTER, format!("{registry}/attestation-key-register:{tag}"));
+        std::env::set_var(RELATED_IMAGE_COMPUTE_PCRS, format!("{registry}/compute-pcrs:{tag}"));
+    }
 }
 
 }
 }
 
 // Test 1: Full upgrade e2e with post-upgrade VM attestation.
-// Boots a VM, triggers upgrade, verifies the VM can still attest after trustee, ak-register, and register-server deployments are converged.
+// Deploys with :drifted images, patches the operator to use :latest, triggers
+// upgrade, and verifies that converge detects the image drift, patches all
+// deployments, and the VM can still attest afterwards.
 virt_test! {
 async fn test_post_upgrade_attestation() -> anyhow::Result<()> {
+    let reg = registry();
+    let current_tag = tag();
+
+    // Phase 1: Push drifted images and deploy with them.
+    let drifted = push_drifted_images(&reg, &current_tag).await?;
+    set_drifted_env(&drifted);
     let test_ctx = setup!().await?;
+    restore_current_env(&reg, &current_tag);
     let client = test_ctx.client();
     let namespace = test_ctx.namespace();
 
@@ -176,26 +246,24 @@ async fn test_post_upgrade_attestation() -> anyhow::Result<()> {
 
     wait_for_install(&tec_api, TEC_NAME).await?;
     wait_for_committed_with_pcrs(&images, APPROVED_IMAGE_NAME, 300).await?;
-    test_ctx.info("Initial install complete, ApprovedImage committed");
+    test_ctx.info("Initial install with drifted images complete");
 
-    // Record pre-upgrade deployment images and generations
-    let pre_trustee_depl = deployments.get(TRUSTEE_DEPLOYMENT).await?;
-    let pre_trustee = deployment_image(&pre_trustee_depl).expect("Trustee should have an image");
-    let pre_trustee_gen = deployment_generation(&pre_trustee_depl);
+    // Verify deployments are running the drifted images.
+    let pre_reg = deployment_image(&deployments.get(REGISTER_SERVER_DEPLOYMENT).await?)
+        .expect("register-server should have an image");
+    assert!(
+        pre_reg.contains(DRIFTED_TAG),
+        "register-server should be running drifted image, got: {pre_reg}"
+    );
+    let pre_ak = deployment_image(&deployments.get(ATTESTATION_KEY_REGISTER_DEPLOYMENT).await?)
+        .expect("ak-register should have an image");
+    assert!(
+        pre_ak.contains(DRIFTED_TAG),
+        "ak-register should be running drifted image, got: {pre_ak}"
+    );
+    test_ctx.info(format!("Drifted images verified: reg={pre_reg}, ak={pre_ak}"));
 
-    let pre_reg_depl = deployments.get(REGISTER_SERVER_DEPLOYMENT).await?;
-    let pre_reg = deployment_image(&pre_reg_depl).expect("register-server should have an image");
-    let pre_reg_gen = deployment_generation(&pre_reg_depl);
-
-    let pre_ak_depl = deployments.get(ATTESTATION_KEY_REGISTER_DEPLOYMENT).await?;
-    let pre_ak = deployment_image(&pre_ak_depl).expect("ak-register should have an image");
-    let pre_ak_gen = deployment_generation(&pre_ak_depl);
-
-    test_ctx.info(format!(
-        "Pre-upgrade: trustee(gen={pre_trustee_gen}), reg(gen={pre_reg_gen}), ak(gen={pre_ak_gen})"
-    ));
-
-    // Boot a VM pre-upgrade and verify it attests
+    // Boot a VM pre-upgrade and verify it attests with drifted images.
     let vm_name = "test-upgrade-vm";
     let backend = virt::create_backend(client.clone(), namespace, vm_name).await?;
     backend.create_vm().await?;
@@ -212,13 +280,90 @@ async fn test_post_upgrade_attestation() -> anyhow::Result<()> {
         pre_encrypted,
         "VM should have encrypted root pre-upgrade"
     );
-    test_ctx.info("Pre-upgrade attestation verified");
+    test_ctx.info("Pre-upgrade attestation verified with drifted images");
 
-    // Trigger upgrade
+    // Phase 2: Patch operator to use current (:latest) images.
+    let current_operator = format!("{reg}/trusted-cluster-operator:{current_tag}");
+    let current_reg = format!("{reg}/registration-server:{current_tag}");
+    let current_ak = format!("{reg}/attestation-key-register:{current_tag}");
+    let current_pcrs = format!("{reg}/compute-pcrs:{current_tag}");
+
+    let env_patch = vec![
+        json!({"name": RELATED_IMAGE_REGISTRATION_SERVER, "value": &current_reg}),
+        json!({"name": RELATED_IMAGE_ATTESTATION_KEY_REGISTER, "value": &current_ak}),
+        json!({"name": RELATED_IMAGE_COMPUTE_PCRS, "value": &current_pcrs}),
+    ];
+    let patch = json!({
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [{
+                        "name": OPERATOR_DEPLOYMENT,
+                        "image": &current_operator,
+                        "env": env_patch
+                    }]
+                }
+            }
+        }
+    });
+    deployments
+        .patch(
+            OPERATOR_DEPLOYMENT,
+            &PatchParams::apply("upgrade-test"),
+            &Patch::Strategic(patch),
+        )
+        .await?;
+    let done = await_condition(
+        deployments.clone(),
+        OPERATOR_DEPLOYMENT,
+        |d: Option<&Deployment>| d.is_some_and(deployment_rollout_complete),
+    );
+    timeout(scaled_duration(120), done)
+        .await
+        .context("operator should roll out with current image")??;
+
+    // The old operator pod may still be alive (Terminating, kube-rs watcher
+    // still active). If we trigger_upgrade now, the old pod could enter the
+    // upgrade branch with its stale env vars, find no drift, and mark the
+    // upgrade complete before the new pod ever sees it.  Wait until the only
+    // running operator pod is the new one.
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let lp = ListParams::default().labels("app=trusted-cluster-operator");
+    let no_old_pods = async {
+        loop {
+            let list = pods.list(&lp).await?;
+            let alive = list
+                .items
+                .iter()
+                .filter(|p| p.metadata.deletion_timestamp.is_none())
+                .count();
+            if alive == 1 && list.items.len() == 1 {
+                break anyhow::Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    };
+    timeout(scaled_duration(60), no_old_pods)
+        .await
+        .context("old operator pod should terminate after rollout")??;
+    test_ctx.info(format!("Operator updated to {current_operator}"));
+
+    // Trigger upgrade -- converge should detect drifted images and patch them.
     trigger_upgrade(&tec_api, TEC_NAME).await?;
     test_ctx.info("Triggered upgrade");
 
-    // Wait for upgrade to complete (Upgrade=Complete)
+    // Invalidation happens early in the upgrade (inside converge_trustee),
+    // so check for it before waiting for the full upgrade to complete.
+    let done = await_condition(
+        images.clone(),
+        APPROVED_IMAGE_NAME,
+        approved_image_was_invalidated,
+    );
+    timeout(scaled_duration(60), done)
+        .await
+        .context("ApprovedImage should be invalidated during upgrade")??;
+    test_ctx.info("ApprovedImage invalidated during upgrade");
+
     let done = await_condition(
         tec_api.clone(),
         TEC_NAME,
@@ -229,49 +374,35 @@ async fn test_post_upgrade_attestation() -> anyhow::Result<()> {
         .context("waiting for Upgrade=Complete")??;
     test_ctx.info("Upgrade completed");
 
-    // Verify all deployments completed their rollout by checking that the
-    // controller has observed the current generation and replicas are updated.
-    for (name, pre_img, pre_gen) in [
-        (TRUSTEE_DEPLOYMENT, &pre_trustee, pre_trustee_gen),
-        (REGISTER_SERVER_DEPLOYMENT, &pre_reg, pre_reg_gen),
-        (ATTESTATION_KEY_REGISTER_DEPLOYMENT, &pre_ak, pre_ak_gen),
-    ] {
+    // Phase 3: Verify converge patched deployments from :drifted to :latest.
+    let post_reg = deployment_image(&deployments.get(REGISTER_SERVER_DEPLOYMENT).await?)
+        .expect("register-server should have an image");
+    assert_eq!(
+        current_reg, post_reg,
+        "converge should have patched register-server to {current_reg}, got {post_reg}"
+    );
+    let post_ak = deployment_image(&deployments.get(ATTESTATION_KEY_REGISTER_DEPLOYMENT).await?)
+        .expect("ak-register should have an image");
+    assert_eq!(
+        current_ak, post_ak,
+        "converge should have patched ak-register to {current_ak}, got {post_ak}"
+    );
+    test_ctx.info(format!("Drift converged: reg {pre_reg} -> {post_reg}, ak {pre_ak} -> {post_ak}"));
+
+    // Verify all deployments completed their rollout.
+    for name in [TRUSTEE_DEPLOYMENT, REGISTER_SERVER_DEPLOYMENT, ATTESTATION_KEY_REGISTER_DEPLOYMENT] {
         let depl = deployments.get(name).await?;
         assert!(
             deployment_rollout_complete(&depl),
-            "{name} should have completed rollout (observedGeneration >= generation, replicas updated)"
+            "{name} should have completed rollout"
         );
-        let post_gen = deployment_generation(&depl);
-        assert!(
-            post_gen >= pre_gen,
-            "{name} generation should not regress: pre={pre_gen}, post={post_gen}"
-        );
-        let post_img = deployment_image(&depl);
-        assert_eq!(
-            Some(pre_img.as_str()),
-            post_img.as_deref(),
-            "{name} image should be unchanged (same operator version)"
-        );
-        test_ctx.info(format!("{name} rollout verified: gen {pre_gen} -> {post_gen}"));
+        test_ctx.info(format!("{name} rollout verified"));
     }
 
-    // Verify ApprovedImage was actually invalidated (Committed=False/Computing)
-    // before being recommitted. This proves recomputation, not just preservation.
-    let done = await_condition(
-        images.clone(),
-        APPROVED_IMAGE_NAME,
-        approved_image_was_invalidated,
-    );
-    timeout(scaled_duration(60), done)
-        .await
-        .context("ApprovedImage should be invalidated (Committed=False/Computing) during upgrade")??;
-    test_ctx.info("ApprovedImage invalidated during upgrade");
-
-    // Now wait for recommit
     wait_for_committed_with_pcrs(&images, APPROVED_IMAGE_NAME, 300).await?;
     test_ctx.info("ApprovedImage recomputed and recommitted after upgrade");
 
-    // Reboot the VM and verify it can still attest after the upgrade
+    // Reboot the VM and verify it can still attest after the upgrade.
     let boot_id = backend.get_boot_id().await?;
     let _reboot = backend.ssh_exec("sudo systemctl reboot").await;
     test_ctx.info("Rebooting VM post-upgrade");
@@ -297,6 +428,7 @@ async fn test_post_upgrade_attestation() -> anyhow::Result<()> {
 // upgrade, and checks that events survive the invalidation-recommit cycle.
 virt_test! {
 async fn test_upgrade_combined_pcrs_events() -> anyhow::Result<()> {
+    restore_current_env(&registry(), &tag());
     let test_ctx = setup!([(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_REF)]).await?;
     let client = test_ctx.client();
     let namespace = test_ctx.namespace();
@@ -464,6 +596,7 @@ async fn test_upgrade_combined_pcrs_events() -> anyhow::Result<()> {
 // Ideally admin should intervene and fix this issue, as cluster may be in a mixed state (fresh instances and old instances).
 virt_test! {
 async fn test_upgrade_failure_vm_still_attests() -> anyhow::Result<()> {
+    restore_current_env(&registry(), &tag());
     let test_ctx = setup!().await?;
     let client = test_ctx.client();
     let namespace = test_ctx.namespace();
@@ -493,25 +626,16 @@ async fn test_upgrade_failure_vm_still_attests() -> anyhow::Result<()> {
     assert!(pre_encrypted, "VM should attest before failure");
     test_ctx.info("VM attested successfully pre-failure");
 
-    // Inject bad image and trigger upgrade
+    // Make the operator *desire* a bad Trustee image, then trigger upgrade.
+    // Patching the live Trustee Deployment is not enough: converge_trustee
+    // treats that as drift against RELATED_IMAGE_TRUSTEE and patches it back.
     let bad_image = "quay.io/nonexistent/bad-image:v999.999.999";
-    let patch = json!({
-        "spec": {
-            "template": {
-                "spec": {
-                    "containers": [{ "name": "kbs", "image": bad_image }]
-                }
-            }
-        }
-    });
-    deployments
-        .patch(
-            TRUSTEE_DEPLOYMENT,
-            &PatchParams::apply("test-upgrade-failure"),
-            &Patch::Strategic(patch),
-        )
+    test_ctx
+        .set_operator_related_image(&deployments, RELATED_IMAGE_TRUSTEE, bad_image)
         .await?;
-    test_ctx.info(format!("Patched Trustee with bad image: {bad_image}"));
+    test_ctx.info(format!(
+        "Operator RELATED_IMAGE_TRUSTEE set to {bad_image}"
+    ));
 
     trigger_upgrade(&tec_api, TEC_NAME).await?;
     test_ctx.info("Triggered upgrade (expecting failure)");
@@ -611,7 +735,10 @@ async fn test_upgrade_failure_vm_still_attests() -> anyhow::Result<()> {
     );
     test_ctx.info("VM attestation verified after failed upgrade");
 
-    // Recovery: restore good image
+    // Recovery: restore the operator's desired image, then the live Trustee pod.
+    test_ctx
+        .set_operator_related_image(&deployments, RELATED_IMAGE_TRUSTEE, &good_image)
+        .await?;
     let good_patch = json!({
         "spec": {
             "template": {

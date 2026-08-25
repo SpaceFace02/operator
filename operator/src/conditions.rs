@@ -143,13 +143,7 @@ mod tests {
     #[test]
     fn test_upgrade_condition_trustee_failed_message() {
         let detail = "Trustee pod failed to become ready";
-        let c = upgrade_condition(
-            UPGRADE_CONDITION,
-            UPGRADE_FAILED,
-            None,
-            &None,
-            Some(detail),
-        );
+        let c = upgrade_condition(UPGRADE_CONDITION, UPGRADE_FAILED, None, &None, Some(detail));
         assert_eq!(c.type_, UPGRADE_CONDITION);
         assert_eq!(c.reason, UPGRADE_FAILED);
         assert_eq!(c.status, "False");
@@ -169,7 +163,7 @@ mod tests {
         assert!(c.message.contains("timeout after 300s"));
         assert!(c.message.contains("Manual intervention required"));
     }
-    
+
     // Trustee stage passes, related images stage also passes. Making sure the upgrade condition is set to True.
     #[test]
     fn test_upgrade_stage_conditions() {

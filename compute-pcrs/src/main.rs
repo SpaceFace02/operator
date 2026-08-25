@@ -4,15 +4,13 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Result, anyhow};
+use chrono::Utc;
 use clap::Parser;
 use compute_pcrs_lib::*;
-use chrono::Utc;
 use kube::{Api, Client};
 use std::{fs::File, io::Read};
 
-use trusted_cluster_operator_lib::{
-    conditions::INSTALLED_REASON, reference_values::*, *,
-};
+use trusted_cluster_operator_lib::{conditions::COMMITTED_REASON, reference_values::*, *};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -58,7 +56,7 @@ async fn main() -> Result<()> {
     let client = Client::try_default().await?;
     let approved_images: Api<ApprovedImage> = Api::default_namespaced(client);
     let image = approved_images.get(&args.resource_name).await?;
-    let committed = committed_condition(INSTALLED_REASON, image.metadata.generation, &None);
+    let committed = committed_condition(COMMITTED_REASON, image.metadata.generation, &None);
     let conditions = Some(vec![committed]);
     // Not used anywhere yet, but good to have.
     let first_seen = image
