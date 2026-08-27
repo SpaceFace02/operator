@@ -10,7 +10,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
-virtualization = []
+virtualization = ["trusted-cluster-operator-test-utils/virtualization"]
 
 [dependencies]
 anyhow.workspace = true

@@ -36,7 +36,13 @@ mod trustee;
 use crate::conditions::*;
 use operator::*;
 
-const DEPLOYMENT_READY_TIMEOUT: Duration = Duration::from_secs(300);
+fn deployment_ready_timeout() -> Duration {
+    let secs = std::env::var("DEPLOYMENT_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    Duration::from_secs(secs)
+}
 
 /// Default fallback version tag for Trustee image if RELATED_IMAGE_TRUSTEE is not set.
 const TRUSTEE_VERSION: &str = "v0.20.0";
@@ -355,12 +361,8 @@ async fn wait_for_deployment_available(client: &Client, name: &str) -> Result<()
     let done = await_condition(deployments, name, |d: Option<&Deployment>| {
         d.is_some_and(deployment_rollout_complete)
     });
-    timeout(DEPLOYMENT_READY_TIMEOUT, done)
-        .await
-        .context(format!(
-            "Deployment {name} did not become available within {}s",
-            DEPLOYMENT_READY_TIMEOUT.as_secs()
-        ))?
+
+    
         .context(format!("Watch error waiting for Deployment {name}"))?;
     info!("Deployment {name} rollout complete");
     Ok(())
