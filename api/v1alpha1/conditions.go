@@ -26,4 +26,12 @@ const (
 	AttestationKeyApprovedCondition     string = "Approved"
 	AttestationKeyRegistrationReason    string = "Registration"
 	AttestationKeyMachineApprovedReason string = "MachineCreated"
+
+	// Operator Upgrade conditions
+	UpgradeCondition            string = "Upgrade"
+	UpgradeInProgress           string = "InProgress"
+	UpgradeComplete             string = "Complete"
+	UpgradeFailed               string = "Failed"
+	TrusteeUpgradeCondition     string = "TrusteeUpgrade"
+	RelatedImagesUpgradeCondition string = "RelatedImagesUpgrade"
 )

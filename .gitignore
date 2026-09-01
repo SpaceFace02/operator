@@ -17,3 +17,5 @@ trusted-cluster-gen
 /target
 bundle/manifests/
 bundle/metadata/
+*.excalidraw
+*.png

@@ -7,10 +7,11 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use env_logger::Env;
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret};
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::reflector;
@@ -20,10 +21,12 @@ use log::{info, warn};
 
 use operator::OperatorContext;
 use operator::{generate_owner_reference, spawn_reflector, sync_cache, upsert_condition};
+use trusted_cluster_operator_lib::endpoints::*;
 use trusted_cluster_operator_lib::{
-    ApprovedImage, AttestationKey, Machine, TrustedExecutionCluster, TrustedExecutionClusterStatus,
-    conditions::*, images::*, update_status,
+    ApprovedImage, ApprovedImageStatus, AttestationKey, Machine, TrustedExecutionCluster, TrustedExecutionClusterStatus,
+    committed_condition,
 };
+use trusted_cluster_operator_lib::{conditions::*, images::*, update_status};
 
 mod attestation_key_register;
 mod conditions;
@@ -34,6 +37,14 @@ mod test_utils;
 mod trustee;
 use crate::conditions::*;
 use operator::*;
+
+fn deployment_ready_timeout() -> Duration {
+    let secs = std::env::var("DEPLOYMENT_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    Duration::from_secs(secs)
+}
 
 /// Default fallback version tag for Trustee image if RELATED_IMAGE_TRUSTEE is not set.
 const TRUSTEE_VERSION: &str = "v0.20.0";
@@ -85,12 +96,15 @@ async fn reconcile(
             installed_condition(uninstalling_reason, generation, existing_status);
         let changed = upsert_condition(&mut conditions, uninstall_condition);
         if changed {
-            update_status!(clusters, name, TrustedExecutionClusterStatus { conditions })?;
+            update_status!(
+                clusters,
+                name,
+                TrustedExecutionClusterStatus {
+                    conditions,
+                    observed_operator_version: None
+                }
+            )?;
         }
-        return Ok(LONG_REQUEUE);
-    }
-
-    if is_installed(cluster.status.clone()) {
         return Ok(LONG_REQUEUE);
     }
 
@@ -103,19 +117,109 @@ async fn reconcile(
         let non_unique_condition =
             installed_condition(NOT_INSTALLED_REASON_NON_UNIQUE, generation, existing_status);
         let changed = upsert_condition(&mut conditions, non_unique_condition);
+        // No need to update observed_operator_version here, as it will be updated in the fresh install and upgrade branches.
         if changed {
-            update_status!(clusters, name, TrustedExecutionClusterStatus { conditions })?;
+            update_status!(
+                clusters,
+                name,
+                TrustedExecutionClusterStatus {
+                    conditions,
+                    observed_operator_version: None
+                }
+            )?;
         }
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
 
+    if is_installed(cluster.status.clone()) {
+        let observed = cluster
+            .status
+            .as_ref()
+            .and_then(|s| s.observed_operator_version.as_deref());
+
+        // No need to upgrade if the version is the same.
+        if observed == Some(COMPONENT_VERSION) {
+            return Ok(LONG_REQUEUE);
+        }
+
+        // A previous upgrade failed and requires manual intervention;
+        // do not retry automatically.
+        // TODO: Add a retry count before giving up and requiring manual intervention.
+        let has_failed = conditions
+            .as_ref()
+            .is_some_and(|cs| cs.iter().any(|c| c.type_ == UPGRADE_CONDITION && c.reason == UPGRADE_FAILED));
+        if has_failed {
+            return Ok(LONG_REQUEUE);
+        }
+
+        // upgrade branch
+        info!("Upgrading TrustedExecutionCluster {name} from {observed:?} to {COMPONENT_VERSION}");
+        let upgrade_cond = upgrade_condition(
+            UPGRADE_CONDITION,
+            UPGRADE_IN_PROGRESS,
+            generation,
+            existing_status,
+            None,
+        );
+        upsert_condition(&mut conditions, upgrade_cond);
+        let status = TrustedExecutionClusterStatus {
+            conditions: conditions.clone(),
+            observed_operator_version: existing_status
+                .as_ref()
+                .and_then(|s| s.observed_operator_version.clone()),
+        };
+        update_status!(clusters, name, status)?;
+
+        let upgrade_result = run_upgrade(
+            &kube_client,
+            &cluster,
+            &mut conditions,
+            generation,
+            existing_status,
+        )
+        .await;
+
+        if let Err(e) = upgrade_result {
+            warn!("Upgrade failed: {e:?}. Setting Upgrade=Failed.");
+            let failed = upgrade_failed_condition(generation, existing_status, &format!("{e:#}"));
+            upsert_condition(&mut conditions, failed);
+            let status = TrustedExecutionClusterStatus {
+                conditions,
+                observed_operator_version: existing_status
+                    .as_ref()
+                    .and_then(|s| s.observed_operator_version.clone()),
+            };
+            update_status!(clusters, name, status)?;
+            return Ok(LONG_REQUEUE);
+        }
+
+        let upgrade_done = upgrade_condition(
+            UPGRADE_CONDITION,
+            UPGRADE_COMPLETE,
+            generation,
+            existing_status,
+            None,
+        );
+        upsert_condition(&mut conditions, upgrade_done);
+        // Only updating observed_operator_version if the upgrade was successful.
+        let status = TrustedExecutionClusterStatus {
+            conditions,
+            observed_operator_version: Some(COMPONENT_VERSION.to_string()),
+        };
+        update_status!(clusters, name, status)?;
+        return Ok(LONG_REQUEUE);
+    }
+
+    // FRESH INSTALL BRANCH
     info!("Setting up TrustedExecutionCluster {name}");
     let installing_condition =
         installed_condition(NOT_INSTALLED_REASON_INSTALLING, generation, existing_status);
     let changed = upsert_condition(&mut conditions, installing_condition);
+    // Not setting observed_operator_version here, as it will be updated only once the fresh install is complete.
     if changed {
         let status = TrustedExecutionClusterStatus {
             conditions: conditions.clone(),
+            observed_operator_version: None,
         };
         update_status!(clusters, name, status)?;
     }
@@ -127,10 +231,14 @@ async fn reconcile(
     }
     reference_values::adopt_approved_images(&ctx, &cluster).await?;
 
+    // Updating observed_operator_version because the fresh install is complete.
     let installed_condition = installed_condition(INSTALLED_REASON, generation, existing_status);
     let changed = upsert_condition(&mut conditions, installed_condition);
     if changed {
-        let status = TrustedExecutionClusterStatus { conditions };
+        let status = TrustedExecutionClusterStatus {
+            conditions,
+            observed_operator_version: Some(COMPONENT_VERSION.to_string()),
+        };
         update_status!(clusters, name, status)?;
     }
     Ok(LONG_REQUEUE)
@@ -140,6 +248,263 @@ async fn install_components(client: &Client, cluster: &TrustedExecutionCluster) 
     install_trustee_configuration(client.clone(), cluster).await?;
     install_register_server(client.clone(), cluster).await?;
     install_attestation_key_register(client.clone(), cluster).await?;
+    Ok(())
+}
+
+async fn invalidate_all_approved_images(client: &Client) -> Result<()> {
+    let images: Api<ApprovedImage> = Api::default_namespaced(client.clone());
+    let image_list = images.list(&Default::default()).await?;
+
+    for image in image_list.items {
+        let name = match image.metadata.name.as_ref() {
+            Some(n) => n.clone(),
+            None => continue,
+        };
+        reference_values::delete_compute_pcrs_job(client, &image.spec.image)
+            .await
+            .context("Failed to delete compute-pcrs Job before PCR recomputation")?;
+        // Setting the not committed condition to trigger PCR recomputation.
+        let not_committed = committed_condition(
+            NOT_COMMITTED_REASON_COMPUTING,
+            image.metadata.generation,
+            &image.status,
+        );
+        let mut conditions = image.status.as_ref().and_then(|s| s.conditions.clone());
+        upsert_condition(&mut conditions, not_committed);
+        let status = ApprovedImageStatus {
+            conditions,
+            pcrs: None,
+            first_seen: image.status.as_ref().and_then(|s| s.first_seen.clone()),
+        };
+        update_status!(images, &name, status)?;
+        info!("Invalidated ApprovedImage {name} for PCR recomputation");
+    }
+    Ok(())
+}
+
+async fn run_upgrade(
+    client: &Client,
+    cluster: &TrustedExecutionCluster,
+    conditions: &mut Option<Vec<Condition>>,
+    generation: Option<i64>,
+    existing_status: &Option<TrustedExecutionClusterStatus>,
+) -> Result<()> {
+    converge_trustee(client, cluster)
+        .await
+        .context("Trustee upgrade stage failed")?;
+    let trustee_done = upgrade_condition(
+        TRUSTEE_UPGRADE_CONDITION,
+        UPGRADE_COMPLETE,
+        generation,
+        existing_status,
+        None,
+    );
+    upsert_condition(conditions, trustee_done);
+
+    converge_related_images(client, cluster)
+        .await
+        .context("Related images upgrade stage failed")?;
+    let related_images_done = upgrade_condition(
+        RELATED_IMAGES_UPGRADE_CONDITION,
+        UPGRADE_COMPLETE,
+        generation,
+        existing_status,
+        None,
+    );
+    upsert_condition(conditions, related_images_done);
+
+    Ok(())
+}
+
+/// True when the Deployment's desired generation is fully rolled out: the
+/// controller has observed the spec, no old replicas remain, and every updated
+/// replica is available. Checking only `availableReplicas >= 1` would treat a
+/// RollingUpdate with a stuck new pod (and a still-ready old pod) as complete.
+fn deployment_rollout_complete(depl: &Deployment) -> bool {
+    let Some(status) = depl.status.as_ref() else {
+        return false;
+    };
+    let generation_seen =
+        status.observed_generation.unwrap_or(0) >= depl.metadata.generation.unwrap_or(0);
+    let desired = depl.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+    let replicas = status.replicas.unwrap_or(0);
+    let updated = status.updated_replicas.unwrap_or(0);
+    let available = status.available_replicas.unwrap_or(0);
+    generation_seen && updated >= desired && replicas <= updated && available >= updated
+}
+
+async fn wait_for_deployment_available(client: &Client, name: &str) -> Result<()> {
+    use kube::runtime::wait::await_condition;
+
+    let deployments: Api<Deployment> = Api::default_namespaced(client.clone());
+    info!("Waiting for Deployment {name} rollout to complete...");
+    let done = await_condition(deployments, name, |d: Option<&Deployment>| {
+        d.is_some_and(deployment_rollout_complete)
+    });
+    done.await
+        .context(format!("Watch error waiting for Deployment {name}"))?;
+    info!("Deployment {name} rollout complete");
+    Ok(())
+}
+
+async fn converge_trustee(client: &Client, cluster: &TrustedExecutionCluster) -> Result<()> {
+    let deployments: Api<Deployment> = Api::default_namespaced(client.clone());
+    let trustee_depl = match deployments.get_opt(TRUSTEE_DEPLOYMENT).await? {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    let default = format!("{TEC_REGISTRY}/key-broker-service:{TRUSTEE_VERSION}");
+    let desired_image = env::var(RELATED_IMAGE_TRUSTEE).ok().unwrap_or(default);
+
+    let live_image = trustee_depl
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|ps| ps.containers.first())
+        .and_then(|c| c.image.as_deref());
+
+    if live_image == Some(desired_image.as_str()) {
+        info!("Trustee image already at desired version, re-syncing API state");
+    } else {
+        info!(
+            "Trustee image drift detected: live={} desired={desired_image}",
+            live_image.unwrap_or("<none>")
+        );
+
+        let owner_reference = generate_owner_reference(cluster)?;
+        let trustee_secret = &cluster.spec.trustee_secret;
+        trustee::generate_trustee_data(client.clone(), owner_reference, trustee_secret)
+            .await
+            .context("Failed to regenerate KBS configuration during upgrade")?;
+
+        let patch = serde_json::json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{
+                            "name": "kbs",
+                            "image": desired_image
+                        }]
+                    }
+                }
+            }
+        });
+        deployments
+            .patch(
+                TRUSTEE_DEPLOYMENT,
+                &kube::api::PatchParams::apply("trusted-cluster-operator"),
+                &kube::api::Patch::Strategic(patch),
+            )
+            .await
+            .context("Failed to patch Trustee Deployment image")?;
+        info!("Patched Trustee Deployment to image {desired_image}");
+    }
+
+    // Waiting for the deployment to become available.
+    wait_for_deployment_available(client, TRUSTEE_DEPLOYMENT)
+        .await
+        .context("Trustee pod failed to become ready after upgrade")?;
+
+    // Invalidating all ApprovedImages to trigger PCR recomputation.
+    invalidate_all_approved_images(client)
+        .await
+        .context("Failed to invalidate ApprovedImages during Trustee upgrade")?;
+
+    let trustee_depl = deployments.get(TRUSTEE_DEPLOYMENT).await?;
+    trustee::trustee_deployment_reconcile(Arc::new(trustee_depl), Arc::new(client.clone()))
+        .await
+        .map_err(|e| anyhow!("{e}"))
+        .context("Failed to sync Trustee API state after upgrade")?;
+
+    info!("Trustee upgrade complete: deployment patched, API state synced");
+    Ok(())
+}
+
+async fn converge_related_images(client: &Client, cluster: &TrustedExecutionCluster) -> Result<()> {
+    // As ak-register and register-server are stateless, a simple patch is enough to upgrade them.
+    converge_related_image(
+        client,
+        cluster,
+        REGISTER_SERVER_DEPLOYMENT,
+        RELATED_IMAGE_REGISTRATION_SERVER,
+        &format!("{TEC_REGISTRY}/registration-server:{COMPONENT_VERSION}"),
+        REGISTER_SERVER_DEPLOYMENT,
+    )
+    .await?;
+    converge_related_image(
+        client,
+        cluster,
+        ATTESTATION_KEY_REGISTER_DEPLOYMENT,
+        RELATED_IMAGE_ATTESTATION_KEY_REGISTER,
+        &format!("{TEC_REGISTRY}/attestation-key-register:{COMPONENT_VERSION}"),
+        "attestation-key-register",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn converge_related_image(
+    client: &Client,
+    _cluster: &TrustedExecutionCluster,
+    deployment_name: &str,
+    env_var: &str,
+    default_image: &str,
+    container_name: &str,
+) -> Result<()> {
+    let deployments: Api<Deployment> = Api::default_namespaced(client.clone());
+    let depl = match deployments.get_opt(deployment_name).await? {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    let desired_image = env::var(env_var).ok().unwrap_or(default_image.to_string());
+
+    let live_image = depl
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|ps| ps.containers.first())
+        .and_then(|c| c.image.as_deref());
+
+    if live_image == Some(desired_image.as_str()) {
+        return Ok(());
+    }
+
+    info!(
+        "{deployment_name} image drift detected: live={} desired={desired_image}",
+        live_image.unwrap_or("<none>")
+    );
+
+    let patch = serde_json::json!({
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [{
+                        "name": container_name,
+                        "image": desired_image
+                    }]
+                }
+            }
+        }
+    });
+    deployments
+        .patch(
+            deployment_name,
+            &kube::api::PatchParams::apply("trusted-cluster-operator"),
+            &kube::api::Patch::Strategic(patch),
+        )
+        .await
+        .context(format!(
+            "Failed to patch {deployment_name} Deployment image"
+        ))?;
+    info!("Patched {deployment_name} to image {desired_image}");
+
+    wait_for_deployment_available(client, deployment_name)
+        .await
+        .context(format!(
+            "{deployment_name} failed to become ready after upgrade"
+        ))?;
     Ok(())
 }
 
@@ -158,11 +523,7 @@ async fn install_trustee_configuration(
     trustee::generate_trustee_auth_keys_secret(client.clone(), owner_reference.clone())
         .await
         .context("Failed to create the auth keys")?;
-    info!("Generate auth keys for the KBS API");
-    trustee::generate_rv_data(client.clone(), owner_reference.clone())
-        .await
-        .context("Failed to create the reference values configmap")?;
-    info!("Created configmap for reference values");
+    info!("Generated auth keys for the KBS API");
     let kbs_port = cluster.spec.trustee_kbs_port;
     trustee::generate_kbs_service(client.clone(), owner_reference.clone(), kbs_port)
         .await
@@ -414,6 +775,7 @@ mod tests {
             cluster.metadata.deletion_timestamp = Some(Time(Timestamp::now()));
             cluster.status = Some(TrustedExecutionClusterStatus {
                 conditions: Some(vec![foreign_condition]),
+                observed_operator_version: None,
             });
             let result = reconcile(Arc::new(cluster), Arc::new(OperatorContext::new(client))).await;
             assert_eq!(result.unwrap(), LONG_REQUEUE);
@@ -486,6 +848,7 @@ mod tests {
         let mut cluster = dummy_cluster();
         cluster.status = Some(TrustedExecutionClusterStatus {
             conditions: Some(vec![pre_existing_installed, foreign_condition]),
+            observed_operator_version: None,
         });
         count_check!(10, clos, |client| {
             let result = reconcile(Arc::new(cluster), Arc::new(OperatorContext::new(client))).await;
@@ -538,10 +901,194 @@ mod tests {
         count_check!(0, clos2, |client| {
             let mut cluster = dummy_cluster();
             cluster.metadata.deletion_timestamp = Some(Time(Timestamp::now()));
-            cluster.status = Some(TrustedExecutionClusterStatus { conditions });
+            cluster.status = Some(TrustedExecutionClusterStatus { conditions, observed_operator_version: None });
             reconcile(Arc::new(cluster), Arc::new(OperatorContext::new(client)))
                 .await
                 .unwrap();
+        });
+    }
+
+    // Tests the installed condition is set to True when the operator version is the same as the component version.
+    #[tokio::test]
+    async fn test_reconcile_installed_same_version_returns_long_requeue() {
+        let installed = Condition {
+            type_: INSTALLED_CONDITION.to_string(),
+            status: "True".to_string(),
+            reason: INSTALLED_REASON.to_string(),
+            message: String::new(),
+            last_transition_time: Time(Timestamp::now()),
+            observed_generation: None,
+        };
+
+        let clos = async |req: Request<Body>, _| panic!("unexpected API call: {req:?}");
+
+        count_check!(0, clos, |client| {
+            let mut cluster = dummy_cluster();
+            cluster.status = Some(TrustedExecutionClusterStatus {
+                conditions: Some(vec![installed]),
+                observed_operator_version: Some(COMPONENT_VERSION.to_string()),
+            });
+            let result = reconcile(Arc::new(cluster), Arc::new(dummy_cluster_ctx(client))).await;
+            assert_eq!(result.unwrap(), LONG_REQUEUE);
+        });
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_upgrade_version_mismatch() {
+        let installed = Condition {
+            type_: INSTALLED_CONDITION.to_string(),
+            status: "True".to_string(),
+            reason: INSTALLED_REASON.to_string(),
+            message: String::new(),
+            last_transition_time: Time(Timestamp::now()),
+            observed_generation: None,
+        };
+
+        let clos = async |req: Request<Body>, ctr| match (ctr, req.method()) {
+            // Upgrade InProgress status patch
+            (0, &Method::PATCH) => Ok(serde_json::to_string(&dummy_cluster()).unwrap()),
+            // converge_trustee: get_opt Deployment (not found = no Trustee to upgrade)
+            (1, &Method::GET) => Err(StatusCode::NOT_FOUND),
+            // converge_related_images: get_opt register-server (not found)
+            (2, &Method::GET) => Err(StatusCode::NOT_FOUND),
+            // converge_related_images: get_opt ak-register (not found)
+            (3, &Method::GET) => Err(StatusCode::NOT_FOUND),
+            // Final upgrade complete status patch
+            (4, &Method::PATCH) => {
+                let body = get_body_string(req).await;
+                assert!(body.contains(UPGRADE_COMPLETE));
+                assert!(body.contains(COMPONENT_VERSION));
+                Ok(serde_json::to_string(&dummy_cluster()).unwrap())
+            }
+            _ => panic!("unexpected API interaction: {req:?}, counter {ctr}"),
+        };
+
+        count_check!(5, clos, |client| {
+            let mut cluster = dummy_cluster();
+            cluster.status = Some(TrustedExecutionClusterStatus {
+                conditions: Some(vec![installed]),
+                observed_operator_version: Some("old-version".to_string()),
+            });
+            let result = reconcile(Arc::new(cluster), Arc::new(dummy_cluster_ctx(client))).await;
+            assert_eq!(result.unwrap(), LONG_REQUEUE);
+        });
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_upgrade_trustee_config_fail_sets_failed() {
+        let installed = Condition {
+            type_: INSTALLED_CONDITION.to_string(),
+            status: "True".to_string(),
+            reason: INSTALLED_REASON.to_string(),
+            message: String::new(),
+            last_transition_time: Time(Timestamp::now()),
+            observed_generation: None,
+        };
+
+        let clos = async |req: Request<Body>, ctr| match (ctr, req.method()) {
+            // Upgrade InProgress status patch
+            (0, &Method::PATCH) => Ok(serde_json::to_string(&dummy_cluster()).unwrap()),
+            // converge_trustee: get_opt Deployment -- found with old image
+            (1, &Method::GET) => {
+                let depl = make_deployment(TRUSTEE_DEPLOYMENT, "0.1.0");
+                Ok(serde_json::to_string(&depl).unwrap())
+            }
+            // generate_trustee_data: create_or_info_if_exists ConfigMap POST -- fail
+            (2, &Method::POST) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+            // Final Upgrade=Failed status patch
+            (3, &Method::PATCH) => {
+                let body = get_body_string(req).await;
+                assert!(
+                    body.contains(UPGRADE_FAILED),
+                    "Should contain Failed reason, got: {body}"
+                );
+                assert!(
+                    body.contains("0.1.0"),
+                    "Should preserve old observedOperatorVersion '0.1.0', got: {body}"
+                );
+                Ok(serde_json::to_string(&dummy_cluster()).unwrap())
+            }
+            _ => panic!("unexpected API interaction: {req:?}, counter {ctr}"),
+        };
+
+        count_check!(4, clos, |client| {
+            let mut cluster = dummy_cluster();
+            cluster.status = Some(TrustedExecutionClusterStatus {
+                conditions: Some(vec![installed]),
+                observed_operator_version: Some("0.1.0".to_string()),
+            });
+            let result = reconcile(Arc::new(cluster), Arc::new(dummy_cluster_ctx(client))).await;
+            assert_eq!(result.unwrap(), LONG_REQUEUE);
+        });
+    }
+
+    fn mock_approved_image(name: &str, with_first_seen: bool) -> ApprovedImage {
+        ApprovedImage {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            spec: trusted_cluster_operator_lib::ApprovedImageSpec {
+                image: format!("quay.io/{name}@sha256:abc"),
+            },
+            status: Some(ApprovedImageStatus {
+                conditions: Some(vec![]),
+                pcrs: Some(crate::test_utils::dummy_status_pcrs()),
+                first_seen: if with_first_seen {
+                    Some("2026-01-01T00:00:00Z".to_string())
+                } else {
+                    None
+                },
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_clears_pcrs_but_keeps_conditions() {
+        let clos = async |req: Request<Body>, ctr| {
+            let mut image = mock_approved_image("img1", false);
+            let committed = Condition {
+                type_: COMMITTED_CONDITION.to_string(),
+                status: "True".to_string(),
+                reason: COMMITTED_REASON.to_string(),
+                message: String::new(),
+                last_transition_time: Time(Timestamp::now()),
+                observed_generation: None,
+            };
+            image.status.as_mut().unwrap().conditions = Some(vec![committed]);
+            match (ctr, req.method()) {
+                (0, &Method::GET) => {
+                    let list = ObjectList {
+                        items: vec![image],
+                        types: Default::default(),
+                        metadata: Default::default(),
+                    };
+                    Ok(serde_json::to_string(&list).unwrap())
+                }
+                (1, &Method::DELETE) => Err(StatusCode::NOT_FOUND),
+                (2, &Method::PATCH) => {
+                    let body = get_body_string(req).await;
+                    assert!(
+                        body.contains(NOT_COMMITTED_REASON_COMPUTING),
+                        "Committed should be set to Computing"
+                    );
+                    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    let conditions = parsed["status"]["conditions"].as_array().unwrap();
+                    assert_eq!(conditions.len(), 1, "Should have exactly one condition");
+                    assert_eq!(
+                        conditions[0]["reason"], NOT_COMMITTED_REASON_COMPUTING,
+                        "Condition reason should be Computing"
+                    );
+                    Ok(serde_json::to_string(&image).unwrap())
+                }
+                _ => panic!("unexpected API interaction: {req:?}, counter {ctr}"),
+            }
+        };
+
+        count_check!(3, clos, |client| {
+            invalidate_all_approved_images(&client)
+                .await
+                .expect("invalidate should succeed");
         });
     }
 }
