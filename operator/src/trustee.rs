@@ -19,7 +19,7 @@ use k8s_openapi::apimachinery::pkg::{
     apis::meta::v1::{LabelSelector, OwnerReference},
     util::intstr::IntOrString,
 };
-use kube::api::{ObjectMeta, Patch, PatchParams};
+use kube::api::ObjectMeta;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::{reflector::ObjectRef, watcher};
 use kube::{Api, Client, Resource};
@@ -36,8 +36,8 @@ use operator::{ControllerError, OperatorContext, TLS_DIR, controller_error_polic
 use operator::{controller_info, create_or_info_if_exists, read_certificate};
 use compute_pcrs_lib::tpmevents::combine::combine_images;
 use trusted_cluster_operator_lib::conditions::COMMITTED_CONDITION;
-use trusted_cluster_operator_lib::reference_values::{status_to_tmp_events, *};
-use trusted_cluster_operator_lib::{ApprovedImage, ApprovedImageStatusPcrs, Machine, endpoints::*};
+use trusted_cluster_operator_lib::reference_values::status_to_tpm_events;
+use trusted_cluster_operator_lib::{ApprovedImage, ApprovedImageStatusPcrs, endpoints::*};
 
 const TRUSTEE_DATA_DIR: &str = "/etc/kbs";
 const KBS_CONFIG_FILE: &str = "kbs-config.toml";
@@ -105,8 +105,8 @@ fn recompute_reference_values(all_pcrs: &[Vec<ApprovedImageStatusPcrs>]) -> Vec<
         .collect()
 }
 
-pub async fn update_reference_values(client: Client) -> Result<()> {
-    let images: Api<ApprovedImage> = Api::default_namespaced(client.clone());
+pub async fn update_reference_values(ctx: &OperatorContext) -> Result<()> {
+    let images: Api<ApprovedImage> = Api::default_namespaced(ctx.client.clone());
     let image_list = images.list(&Default::default()).await?;
 
     let all_pcrs: Vec<Vec<ApprovedImageStatusPcrs>> = image_list
@@ -127,7 +127,7 @@ pub async fn update_reference_values(client: Client) -> Result<()> {
 
     let reference_values = recompute_reference_values(&all_pcrs);
 
-    sync_reference_values(&client, &reference_values)
+    sync_reference_values(ctx, &reference_values)
         .await
         .context("Failed to sync reference values to KBS")?;
     info!(
@@ -215,9 +215,9 @@ async fn sync_reference_values(
     Ok(())
 }
 
-pub async fn sync_resource_policy(client: Client) -> Result<()> {
-    let auth_token = get_auth_key_token(&client).await?;
-    let (url, certs) = get_kbs_connection(&client).await?;
+pub async fn sync_resource_policy(ctx: &OperatorContext) -> Result<()> {
+    let auth_token = get_auth_key_token(ctx)?;
+    let (url, certs) = get_kbs_connection(ctx)?;
     let policy = include_str!("resource.rego");
     info!("Sending resource policy to KBS API...");
     kbs_client::set_resource_policy(&url, Some(auth_token), policy.as_bytes().to_vec(), certs)
@@ -262,7 +262,7 @@ pub(crate) async fn trustee_deployment_reconcile(
             warn!("Failed to sync attestation policy to KBS: {e}");
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
-        if let Err(e) = update_reference_values(c.clone()).await {
+        if let Err(e) = update_reference_values(&ctx).await {
             warn!("Failed to sync reference values to KBS: {e}");
             return Ok(Action::requeue(Duration::from_secs(30)));
         }

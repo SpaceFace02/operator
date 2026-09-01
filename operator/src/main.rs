@@ -16,6 +16,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::reflector;
 use kube::runtime::watcher;
+use kube::api::DeleteParams;
 use kube::{Api, Client};
 use log::{info, warn};
 
@@ -171,7 +172,7 @@ async fn reconcile(
         update_status!(clusters, name, status)?;
 
         let upgrade_result = run_upgrade(
-            &kube_client,
+            &ctx,
             &cluster,
             &mut conditions,
             generation,
@@ -283,13 +284,13 @@ async fn invalidate_all_approved_images(client: &Client) -> Result<()> {
 }
 
 async fn run_upgrade(
-    client: &Client,
+    ctx: &Arc<OperatorContext>,
     cluster: &TrustedExecutionCluster,
     conditions: &mut Option<Vec<Condition>>,
     generation: Option<i64>,
     existing_status: &Option<TrustedExecutionClusterStatus>,
 ) -> Result<()> {
-    converge_trustee(client, cluster)
+    converge_trustee(ctx, cluster)
         .await
         .context("Trustee upgrade stage failed")?;
     let trustee_done = upgrade_condition(
@@ -301,7 +302,7 @@ async fn run_upgrade(
     );
     upsert_condition(conditions, trustee_done);
 
-    converge_related_images(client, cluster)
+    converge_related_images(&ctx.client, cluster)
         .await
         .context("Related images upgrade stage failed")?;
     let related_images_done = upgrade_condition(
@@ -336,18 +337,24 @@ fn deployment_rollout_complete(depl: &Deployment) -> bool {
 async fn wait_for_deployment_available(client: &Client, name: &str) -> Result<()> {
     use kube::runtime::wait::await_condition;
 
+    let deadline = deployment_ready_timeout();
     let deployments: Api<Deployment> = Api::default_namespaced(client.clone());
-    info!("Waiting for Deployment {name} rollout to complete...");
+    info!("Waiting for Deployment {name} rollout to complete (timeout {deadline:?})...");
     let done = await_condition(deployments, name, |d: Option<&Deployment>| {
         d.is_some_and(deployment_rollout_complete)
     });
-    done.await
-        .context(format!("Watch error waiting for Deployment {name}"))?;
+    tokio::time::timeout(deadline, done)
+        .await
+        .map_err(|_| anyhow!("Deployment {name} did not become ready within {deadline:?}"))??;
     info!("Deployment {name} rollout complete");
     Ok(())
 }
 
-async fn converge_trustee(client: &Client, cluster: &TrustedExecutionCluster) -> Result<()> {
+async fn converge_trustee(
+    ctx: &Arc<OperatorContext>,
+    cluster: &TrustedExecutionCluster,
+) -> Result<()> {
+    let client = &ctx.client;
     let deployments: Api<Deployment> = Api::default_namespaced(client.clone());
     let trustee_depl = match deployments.get_opt(TRUSTEE_DEPLOYMENT).await? {
         Some(d) => d,
@@ -372,52 +379,42 @@ async fn converge_trustee(client: &Client, cluster: &TrustedExecutionCluster) ->
             live_image.unwrap_or("<none>")
         );
 
-        let owner_reference = generate_owner_reference(cluster)?;
-        let trustee_secret = &cluster.spec.trustee_secret;
-        trustee::generate_trustee_data(client.clone(), owner_reference, trustee_secret)
-            .await
-            .context("Failed to regenerate KBS configuration during upgrade")?;
-
-        let patch = serde_json::json!({
-            "spec": {
-                "template": {
-                    "spec": {
-                        "containers": [{
-                            "name": "kbs",
-                            "image": desired_image
-                        }]
-                    }
-                }
-            }
-        });
+        // Trustee is stateful (auth keys, volume layout, config) and may
+        // have changed significantly across versions. Delete stale
+        // resources and reinstall from scratch so that the config,
+        // secrets, volumes, and pod spec match the current operator.
         deployments
-            .patch(
-                TRUSTEE_DEPLOYMENT,
-                &kube::api::PatchParams::apply("trusted-cluster-operator"),
-                &kube::api::Patch::Strategic(patch),
-            )
+            .delete(TRUSTEE_DEPLOYMENT, &DeleteParams::default())
             .await
-            .context("Failed to patch Trustee Deployment image")?;
-        info!("Patched Trustee Deployment to image {desired_image}");
+            .context("Failed to delete old Trustee Deployment")?;
+        let configmaps: Api<ConfigMap> = Api::default_namespaced(client.clone());
+        if configmaps.get_opt(trustee::TRUSTEE_DATA_MAP).await?.is_some() {
+            configmaps
+                .delete(trustee::TRUSTEE_DATA_MAP, &DeleteParams::default())
+                .await
+                .context("Failed to delete old trustee-data ConfigMap")?;
+        }
+        info!("Deleted old Trustee resources for fresh reinstall");
+
+        install_trustee_configuration(client.clone(), cluster).await?;
+        info!("Reinstalled Trustee from scratch");
     }
 
-    // Waiting for the deployment to become available.
     wait_for_deployment_available(client, TRUSTEE_DEPLOYMENT)
         .await
         .context("Trustee pod failed to become ready after upgrade")?;
 
-    // Invalidating all ApprovedImages to trigger PCR recomputation.
     invalidate_all_approved_images(client)
         .await
         .context("Failed to invalidate ApprovedImages during Trustee upgrade")?;
 
     let trustee_depl = deployments.get(TRUSTEE_DEPLOYMENT).await?;
-    trustee::trustee_deployment_reconcile(Arc::new(trustee_depl), Arc::new(client.clone()))
+    trustee::trustee_deployment_reconcile(Arc::new(trustee_depl), Arc::clone(ctx))
         .await
         .map_err(|e| anyhow!("{e}"))
         .context("Failed to sync Trustee API state after upgrade")?;
 
-    info!("Trustee upgrade complete: deployment patched, API state synced");
+    info!("Trustee upgrade complete: reinstalled from scratch, API state synced");
     Ok(())
 }
 
@@ -658,7 +655,6 @@ async fn main() -> Result<()> {
     attestation_key_register::launch_ak_controller(ctx.clone()).await;
     attestation_key_register::launch_machine_ak_controller(ctx.clone()).await;
     attestation_key_register::launch_secret_ak_controller(ctx.clone()).await;
-    reference_values::create_pcrs_config_map(kube_client.clone()).await?;
     reference_values::launch_rv_image_controller(ctx.clone()).await;
     reference_values::launch_rv_job_controller(ctx.clone()).await;
     trustee::launch_trustee_sync_controller(ctx.clone()).await;

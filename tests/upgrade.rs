@@ -11,7 +11,7 @@ use anyhow::Context;
 use compute_pcrs_lib::Pcr;
 use compute_pcrs_lib::tpmevents::{TPMEvent, TPMEventID};
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
 use kube::api::{ListParams, Patch, PatchParams};
 use kube::runtime::wait::await_condition;
 use kube::Api;
@@ -147,20 +147,18 @@ fn extract_pcr_vals(img: &ApprovedImage) -> Vec<(i64, String)> {
         .unwrap_or_default()
 }
 
-fn registry() -> String {
-    std::env::var("REGISTRY").unwrap_or_else(|_| "localhost:5000".to_string())
-}
-
-fn tag() -> String {
-    std::env::var("TAG").unwrap_or_else(|_| "latest".to_string())
-}
-
-const OLD_OPERATOR_IMAGE: &str = "quay.io/trusted-execution-clusters/trusted-cluster-operator:v0.2.0";
+const OLD_OPERATOR_IMAGE: &str = "quay.io/trusted-execution-clusters/trusted-cluster-operator:v0.2.2";
 const OLD_TRUSTEE_IMAGE: &str = "quay.io/trusted-execution-clusters/key-broker-service:v0.17.0";
-const OLD_REG_SERVER_IMAGE: &str = "quay.io/trusted-execution-clusters/registration-server:v0.2.0";
-const OLD_AK_REGISTER_IMAGE: &str = "quay.io/trusted-execution-clusters/attestation-key-register:v0.2.0";
-const OLD_COMPUTE_PCRS_IMAGE: &str = "quay.io/trusted-execution-clusters/compute-pcrs:v0.2.0";
-const NEW_TRUSTEE_IMAGE: &str = "quay.io/trusted-execution-clusters/key-broker-service:v0.20.0";
+const OLD_REG_SERVER_IMAGE: &str = "quay.io/trusted-execution-clusters/registration-server:v0.2.2";
+const OLD_AK_REGISTER_IMAGE: &str = "quay.io/trusted-execution-clusters/attestation-key-register:v0.2.2";
+const OLD_COMPUTE_PCRS_IMAGE: &str = "quay.io/trusted-execution-clusters/compute-pcrs:v0.2.2";
+
+const CURRENT_TAG: &str = "upgrade-mock";
+const CURRENT_OPERATOR_IMAGE: &str = "quay.io/trusted-execution-clusters/trusted-cluster-operator:upgrade-mock";
+const CURRENT_TRUSTEE_IMAGE: &str = "quay.io/trusted-execution-clusters/key-broker-service:v0.20.0";
+const CURRENT_REG_SERVER_IMAGE: &str = "quay.io/trusted-execution-clusters/registration-server:upgrade-mock";
+const CURRENT_AK_REGISTER_IMAGE: &str = "quay.io/trusted-execution-clusters/attestation-key-register:upgrade-mock";
+const CURRENT_COMPUTE_PCRS_IMAGE: &str = "quay.io/trusted-execution-clusters/compute-pcrs:upgrade-mock";
 
 /// Patches the operator Deployment image and RELATED_IMAGE_* env vars in
 /// a single strategic merge patch and waits for the rollout.
@@ -204,10 +202,6 @@ async fn patch_operator_with_images(
     Ok(())
 }
 
-fn deployment_generation(depl: &Deployment) -> i64 {
-    depl.metadata.generation.unwrap_or(0)
-}
-
 }
 }
 
@@ -216,7 +210,16 @@ fn deployment_generation(depl: &Deployment) -> i64 {
 // that events survive the invalidation-recommit cycle and PCRs are identical.
 virt_test! {
 async fn test_upgrade_combined_pcrs_events() -> anyhow::Result<()> {
-    let test_ctx = setup!([(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_REF)]).await?;
+    let test_ctx = setup!(
+        [(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_REF)],
+        images: [
+            ("OPERATOR_IMAGE", CURRENT_OPERATOR_IMAGE),
+            ("TRUSTEE_IMAGE", CURRENT_TRUSTEE_IMAGE),
+            (RELATED_IMAGE_REGISTRATION_SERVER, CURRENT_REG_SERVER_IMAGE),
+            (RELATED_IMAGE_ATTESTATION_KEY_REGISTER, CURRENT_AK_REGISTER_IMAGE),
+            (RELATED_IMAGE_COMPUTE_PCRS, CURRENT_COMPUTE_PCRS_IMAGE),
+        ]
+    ).await?;
     let client = test_ctx.client();
     let namespace = test_ctx.namespace();
 
@@ -310,7 +313,13 @@ async fn test_upgrade_combined_pcrs_events() -> anyhow::Result<()> {
 // and still attest against the old Trustee pod.
 virt_test! {
 async fn test_upgrade_failure_vm_still_attests() -> anyhow::Result<()> {
-    let test_ctx = setup!().await?;
+    let test_ctx = setup!(images: [
+        ("OPERATOR_IMAGE", CURRENT_OPERATOR_IMAGE),
+        ("TRUSTEE_IMAGE", CURRENT_TRUSTEE_IMAGE),
+        (RELATED_IMAGE_REGISTRATION_SERVER, CURRENT_REG_SERVER_IMAGE),
+        (RELATED_IMAGE_ATTESTATION_KEY_REGISTER, CURRENT_AK_REGISTER_IMAGE),
+        (RELATED_IMAGE_COMPUTE_PCRS, CURRENT_COMPUTE_PCRS_IMAGE),
+    ]).await?;
     let client = test_ctx.client();
     let namespace = test_ctx.namespace();
 
@@ -357,13 +366,14 @@ async fn test_upgrade_failure_vm_still_attests() -> anyhow::Result<()> {
         TEC_NAME,
         tec_has_condition_reason(UPGRADE_CONDITION, UPGRADE_FAILED),
     );
-    timeout(scaled_duration(120), done)
+    let tec = timeout(scaled_duration(120), done)
         .await
-        .context("waiting for Upgrade=Failed")??;
+        .context("waiting for Upgrade=Failed")??
+        .expect("TEC should exist after upgrade failure");
     test_ctx.info("Upgrade=Failed detected");
 
-    // Verify failure condition.
-    let tec = tec_api.get(TEC_NAME).await?;
+    // Verify failure condition using the TEC snapshot from the watch
+    // (a separate GET could race with the next reconcile cycle).
     let conditions = tec.status.as_ref()
         .and_then(|s| s.conditions.as_ref())
         .expect("TEC should have conditions after failed upgrade");
@@ -430,151 +440,185 @@ async fn test_upgrade_failure_vm_still_attests() -> anyhow::Result<()> {
 }
 }
 
-// TODO: Uncomment this out once we have a release, and can test the operator upgrades without any CRD changes.
-//! Test 3: Real version upgrade (operator v0.2.0 -> v0.2.2, Trustee v0.17.0 -> v0.20.0).
-//! Deploys the v0.2.0 operator with old component images via setup!() image overrides, then patches the operator Deployment to v0.2.2 -- exactly as OLM or a human would do.
+// Test 3: Real version upgrade (operator v0.2.2 -> upgrade-mock, Trustee v0.17.0 -> v0.20.0).
+// v0.2.2 stored PCRs in a ConfigMap; upgrade-mock stores them in ApprovedImage status.
+// Verifies the ConfigMap approach works pre-upgrade, then after upgrade verifies
+// Trustee is rebuilt from scratch (secret, config present), ApprovedImage.status.pcrs
+// is populated, and the VM can still attest against the new Trustee.
+virt_test! {
+async fn test_real_version_upgrade() -> anyhow::Result<()> {
+    // Phase 1: Deploy with old operator binary and old component images.
+    let test_ctx = setup!(images: [
+        ("OPERATOR_IMAGE", OLD_OPERATOR_IMAGE),
+        ("TRUSTEE_IMAGE", OLD_TRUSTEE_IMAGE),
+        (RELATED_IMAGE_REGISTRATION_SERVER, OLD_REG_SERVER_IMAGE),
+        (RELATED_IMAGE_ATTESTATION_KEY_REGISTER, OLD_AK_REGISTER_IMAGE),
+        (RELATED_IMAGE_COMPUTE_PCRS, OLD_COMPUTE_PCRS_IMAGE),
+    ]).await?;
+    let client = test_ctx.client();
+    let namespace = test_ctx.namespace();
 
-// virt_test! {
-// async fn test_real_version_upgrade() -> anyhow::Result<()> {
-//     let reg = registry();
-//     let current_tag = tag();
+    let tec_api: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
+    let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
 
-//     // Phase 1: Deploy with old operator binary and old component images.
-//     let test_ctx = setup!(images: [
-//         ("OPERATOR_IMAGE", OLD_OPERATOR_IMAGE),
-//         ("TRUSTEE_IMAGE", OLD_TRUSTEE_IMAGE),
-//         (RELATED_IMAGE_REGISTRATION_SERVER, OLD_REG_SERVER_IMAGE),
-//         (RELATED_IMAGE_ATTESTATION_KEY_REGISTER, OLD_AK_REGISTER_IMAGE),
-//         (RELATED_IMAGE_COMPUTE_PCRS, OLD_COMPUTE_PCRS_IMAGE),
-//     ]).await?;
-//     let client = test_ctx.client();
-//     let namespace = test_ctx.namespace();
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let services: Api<Service> = Api::namespaced(client.clone(), namespace);
 
-//     let tec_api: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
-//     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
-//     let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
+    wait_for_install(&tec_api, TEC_NAME).await?;
+    test_ctx.info("Initial install with v0.2.2 operator complete");
 
-//     wait_for_install(&tec_api, TEC_NAME).await?;
-//     wait_for_committed_with_pcrs(&images, APPROVED_IMAGE_NAME, 300).await?;
-//     test_ctx.info("Initial install with v0.2.0 operator complete");
+    // v0.2.2 stores PCRs in a ConfigMap, not in ApprovedImage.status.pcrs.
+    let cm_exists = await_condition(configmaps.clone(), "image-pcrs", |cm: Option<&ConfigMap>| {
+        cm.and_then(|c| c.data.as_ref())
+            .and_then(|d| d.get("image-pcrs.json"))
+            .is_some_and(|v| !v.is_empty())
+    });
+    timeout(scaled_duration(300), cm_exists)
+        .await
+        .context("waiting for image-pcrs ConfigMap to be populated by v0.2.2 operator")??;
+    test_ctx.info("image-pcrs ConfigMap present with PCR data (v0.2.2 approach)");
 
-//     // Verify old images are actually running.
-//     let pre_trustee = deployment_image(&deployments.get(TRUSTEE_DEPLOYMENT).await?).unwrap();
-//     assert!(pre_trustee.contains("v0.17.0"), "Trustee should be v0.17.0, got: {pre_trustee}");
-//     let pre_reg = deployment_image(&deployments.get(REGISTER_SERVER_DEPLOYMENT).await?).unwrap();
-//     assert!(pre_reg.contains("v0.2.0"), "register-server should be v0.2.0, got: {pre_reg}");
-//     let pre_ak = deployment_image(&deployments.get(ATTESTATION_KEY_REGISTER_DEPLOYMENT).await?).unwrap();
-//     assert!(pre_ak.contains("v0.2.0"), "ak-register should be v0.2.0, got: {pre_ak}");
-//     test_ctx.info(format!("Old images: trustee={pre_trustee}, reg={pre_reg}, ak={pre_ak}"));
+    let done = await_condition(images.clone(), APPROVED_IMAGE_NAME, approved_image_is_committed);
+    timeout(scaled_duration(60), done)
+        .await
+        .context("waiting for ApprovedImage to be committed under v0.2.2")??;
+    let pre_image = images.get(APPROVED_IMAGE_NAME).await?;
+    let pre_has_status_pcrs = pre_image.status.as_ref()
+        .and_then(|s| s.pcrs.as_ref())
+        .is_some_and(|p| !p.is_empty());
+    assert!(!pre_has_status_pcrs,
+        "v0.2.2 should NOT populate ApprovedImage.status.pcrs");
+    test_ctx.info("ApprovedImage committed without status.pcrs (expected for v0.2.2)");
 
-//     let pre_image = images.get(APPROVED_IMAGE_NAME).await?;
-//     let pre_pcr_vals = extract_pcr_vals(&pre_image);
+    // Verify v0.2.2 images are running.
+    let pre_trustee = deployment_image(&deployments.get(TRUSTEE_DEPLOYMENT).await?).unwrap();
+    assert!(pre_trustee.contains("v0.17.0"), "Trustee should be v0.17.0, got: {pre_trustee}");
+    let pre_reg = deployment_image(&deployments.get(REGISTER_SERVER_DEPLOYMENT).await?).unwrap();
+    assert!(pre_reg.contains("v0.2.2"), "register-server should be v0.2.2, got: {pre_reg}");
+    test_ctx.info(format!("Pre-upgrade images: trustee={pre_trustee}, reg={pre_reg}"));
 
-//     let pre_trustee_gen = deployment_generation(&deployments.get(TRUSTEE_DEPLOYMENT).await?);
-//     let pre_reg_gen = deployment_generation(&deployments.get(REGISTER_SERVER_DEPLOYMENT).await?);
-//     let pre_ak_gen = deployment_generation(&deployments.get(ATTESTATION_KEY_REGISTER_DEPLOYMENT).await?);
+    // Boot a VM and verify attestation with Trustee v0.17.0.
+    let vm_name = "test-real-upgrade-vm";
+    let backend = virt::create_backend(client.clone(), namespace, vm_name).await?;
+    backend.create_vm().await?;
+    backend.wait_for_running(scaled_timeout(600)).await?;
+    backend.wait_for_vm_ssh_ready(scaled_timeout(600), None).await?;
 
-//     // Boot a VM and verify attestation with old Trustee v0.17.0.
-//     let vm_name = "test-real-upgrade-vm";
-//     let backend = virt::create_backend(client.clone(), namespace, vm_name).await?;
-//     backend.create_vm().await?;
-//     backend.wait_for_running(scaled_timeout(600)).await?;
-//     backend.wait_for_vm_ssh_ready(scaled_timeout(600), None).await?;
+    let root_key = backend.get_root_key(client.clone(), namespace).await?;
+    assert!(backend.verify_encrypted_root(root_key.as_deref()).await?,
+        "VM should attest with Trustee v0.17.0");
+    test_ctx.info("Pre-upgrade attestation verified (Trustee v0.17.0)");
 
-//     let root_key = backend.get_root_key(client.clone(), namespace).await?;
-//     assert!(backend.verify_encrypted_root(root_key.as_deref()).await?,
-//         "VM should attest with old Trustee v0.17.0");
-//     test_ctx.info("Pre-upgrade attestation verified (Trustee v0.17.0)");
+    // Phase 2: Upgrade v0.2.2 -> upgrade-mock (Trustee v0.17.0 -> v0.20.0).
+    patch_operator_with_images(
+        &deployments,
+        CURRENT_OPERATOR_IMAGE,
+        CURRENT_TRUSTEE_IMAGE,
+        CURRENT_REG_SERVER_IMAGE,
+        CURRENT_AK_REGISTER_IMAGE,
+        CURRENT_COMPUTE_PCRS_IMAGE,
+    ).await?;
+    test_ctx.info("Operator upgraded from v0.2.2 to upgrade-mock");
 
-//     // Phase 2: Upgrade -- exactly what OLM or a human would do.
-//     // Patch the operator Deployment to v0.2.2 binary with new component images.
-//     let new_operator = format!("{reg}/trusted-cluster-operator:{current_tag}");
-//     let new_reg_srv = format!("{reg}/registration-server:{current_tag}");
-//     let new_ak_reg = format!("{reg}/attestation-key-register:{current_tag}");
-//     let new_compute_pcrs = format!("{reg}/compute-pcrs:{current_tag}");
-//     patch_operator_with_images(
-//         &deployments,
-//         &new_operator,
-//         NEW_TRUSTEE_IMAGE,
-//         &new_reg_srv,
-//         &new_ak_reg,
-//         &new_compute_pcrs,
-//     ).await?;
-//     test_ctx.info("Operator upgraded to v0.2.2 with new component images");
+    // Phase 3: Verify the upgrade completes.
+    let done = await_condition(
+        tec_api.clone(),
+        TEC_NAME,
+        tec_has_condition_reason(UPGRADE_CONDITION, UPGRADE_COMPLETE),
+    );
+    timeout(scaled_duration(600), done)
+        .await
+        .context("waiting for Upgrade=Complete after real version upgrade")??;
+    test_ctx.info("Upgrade completed");
 
-//     // Phase 3: Verify the upgrade completes.
-//     let done = await_condition(
-//         tec_api.clone(),
-//         TEC_NAME,
-//         tec_has_condition_reason(UPGRADE_CONDITION, UPGRADE_COMPLETE),
-//     );
-//     timeout(scaled_duration(600), done)
-//         .await
-//         .context("waiting for Upgrade=Complete after real version upgrade")??;
-//     test_ctx.info("Upgrade completed");
+    // Verify Trustee upgraded from v0.17.0 to v0.20.0.
+    let post_trustee = deployment_image(&deployments.get(TRUSTEE_DEPLOYMENT).await?).unwrap();
+    assert!(post_trustee.contains("v0.20.0"), "Trustee should be v0.20.0, got: {post_trustee}");
+    test_ctx.info(format!("Trustee upgraded: {pre_trustee} -> {post_trustee}"));
 
-//     // Verify deployment generations increased (real image drift).
-//     let post_trustee_gen = deployment_generation(&deployments.get(TRUSTEE_DEPLOYMENT).await?);
-//     let post_reg_gen = deployment_generation(&deployments.get(REGISTER_SERVER_DEPLOYMENT).await?);
-//     let post_ak_gen = deployment_generation(&deployments.get(ATTESTATION_KEY_REGISTER_DEPLOYMENT).await?);
-//     assert!(post_trustee_gen > pre_trustee_gen,
-//         "Trustee gen should increase: {pre_trustee_gen} -> {post_trustee_gen}");
-//     assert!(post_reg_gen > pre_reg_gen,
-//         "register-server gen should increase: {pre_reg_gen} -> {post_reg_gen}");
-//     assert!(post_ak_gen > pre_ak_gen,
-//         "ak-register gen should increase: {pre_ak_gen} -> {post_ak_gen}");
-//     test_ctx.info(format!(
-//         "Generations: trustee {pre_trustee_gen}->{post_trustee_gen}, \
-//          reg {pre_reg_gen}->{post_reg_gen}, ak {pre_ak_gen}->{post_ak_gen}"
-//     ));
+    // Verify component images upgraded.
+    let post_reg = deployment_image(&deployments.get(REGISTER_SERVER_DEPLOYMENT).await?).unwrap();
+    assert!(post_reg.contains(CURRENT_TAG),
+        "register-server should be {CURRENT_TAG}, got: {post_reg}");
+    let post_ak = deployment_image(&deployments.get(ATTESTATION_KEY_REGISTER_DEPLOYMENT).await?).unwrap();
+    assert!(post_ak.contains(CURRENT_TAG),
+        "ak-register should be {CURRENT_TAG}, got: {post_ak}");
+    test_ctx.info(format!("Post-upgrade images: reg={post_reg}, ak={post_ak}"));
 
-//     // Verify images changed from old to new.
-//     let post_trustee = deployment_image(&deployments.get(TRUSTEE_DEPLOYMENT).await?).unwrap();
-//     assert!(post_trustee.contains("v0.20.0"), "Trustee should be v0.20.0, got: {post_trustee}");
-//     let post_reg = deployment_image(&deployments.get(REGISTER_SERVER_DEPLOYMENT).await?).unwrap();
-//     assert!(!post_reg.contains("v0.2.0"), "register-server should not be v0.2.0, got: {post_reg}");
-//     let post_ak = deployment_image(&deployments.get(ATTESTATION_KEY_REGISTER_DEPLOYMENT).await?).unwrap();
-//     assert!(!post_ak.contains("v0.2.0"), "ak-register should not be v0.2.0, got: {post_ak}");
-//     test_ctx.info(format!("New images: trustee={post_trustee}, reg={post_reg}, ak={post_ak}"));
+    // --- Trustee rebuilt from scratch: verify all infrastructure ---
 
-//     for name in [TRUSTEE_DEPLOYMENT, REGISTER_SERVER_DEPLOYMENT, ATTESTATION_KEY_REGISTER_DEPLOYMENT] {
-//         assert!(deployment_rollout_complete(&deployments.get(name).await?),
-//             "{name} rollout should be complete");
-//     }
+    // Auth key pair (used by operator to authenticate with KBS API).
+    let trustee_secret = secrets.get("trustee-auth").await
+        .context("trustee-auth secret should exist after upgrade")?;
+    let auth_data = trustee_secret.data.as_ref()
+        .expect("trustee-auth secret should have data");
+    assert!(auth_data.contains_key("public.pub"),
+        "trustee-auth should contain public.pub");
+    assert!(auth_data.contains_key("private.key"),
+        "trustee-auth should contain private.key");
+    test_ctx.info("trustee-auth secret present with public.pub and private.key");
 
-//     // Verify ApprovedImage was recommitted with PCRs + events.
-//     wait_for_committed_with_pcrs(&images, APPROVED_IMAGE_NAME, 300).await?;
-//     let post_image = images.get(APPROVED_IMAGE_NAME).await?;
-//     let post_events = extract_events(&post_image);
-//     assert!(!post_events.is_empty(), "ApprovedImage should have events after upgrade");
-//     for (pcr_id, events) in &post_events {
-//         assert!(!events.is_empty(), "PCR {pcr_id} should have events after upgrade");
-//     }
+    // KBS configuration.
+    let trustee_data_cm = configmaps.get("trustee-data").await
+        .context("trustee-data ConfigMap should exist after upgrade")?;
+    let cm_data = trustee_data_cm.data.as_ref()
+        .expect("trustee-data ConfigMap should have data");
+    let kbs_config = cm_data.get("kbs-config.toml")
+        .expect("trustee-data should contain kbs-config.toml");
+    assert!(!kbs_config.is_empty(), "kbs-config.toml should not be empty");
+    test_ctx.info("trustee-data ConfigMap with kbs-config.toml present");
 
-//     let post_pcr_vals = extract_pcr_vals(&post_image);
-//     assert_eq!(pre_pcr_vals, post_pcr_vals,
-//         "PCR values should be identical (same approved image)");
-//     test_ctx.info("PCRs and events verified after upgrade");
+    // KBS service.
+    services.get(TRUSTEE_SERVICE).await
+        .context("kbs-service should exist after upgrade")?;
+    test_ctx.info("kbs-service Service present");
 
-//     // Verify observedOperatorVersion was stamped by the new operator.
-//     let tec = tec_api.get(TEC_NAME).await?;
-//     let new_version = tec.status.as_ref()
-//         .and_then(|s| s.observed_operator_version.as_deref());
-//     assert!(new_version.is_some(), "observedOperatorVersion should be set after upgrade");
-//     test_ctx.info(format!("observedOperatorVersion: {new_version:?}"));
+    // Trustee deployment available.
+    let trustee_depl = deployments.get(TRUSTEE_DEPLOYMENT).await?;
+    let trustee_available = trustee_depl.status.as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Available" && c.status == "True"));
+    assert!(trustee_available, "Trustee deployment should be Available after upgrade");
+    test_ctx.info("Trustee deployment Available");
 
-//     // Reboot VM and verify attestation with new Trustee v0.20.0.
-//     let boot_id = backend.get_boot_id().await?;
-//     let _reboot = backend.ssh_exec("sudo systemctl reboot").await;
-//     test_ctx.info("Rebooting VM post-upgrade");
-//     backend.wait_for_vm_ssh_ready(scaled_timeout(300), Some(&boot_id)).await?;
+    // --- ApprovedImage PCRs and events ---
 
-//     assert!(backend.verify_encrypted_root(root_key.as_deref()).await?,
-//         "VM should attest against new Trustee v0.20.0 after upgrade");
-//     test_ctx.info("Post-upgrade attestation verified (Trustee v0.20.0)");
+    wait_for_committed_with_pcrs(&images, APPROVED_IMAGE_NAME, 300).await?;
+    let post_image = images.get(APPROVED_IMAGE_NAME).await?;
+    let post_pcr_vals = extract_pcr_vals(&post_image);
+    assert!(!post_pcr_vals.is_empty(),
+        "New operator should populate ApprovedImage.status.pcrs");
+    let post_events = extract_events(&post_image);
+    assert!(!post_events.is_empty(),
+        "New operator should populate ApprovedImage events");
+    test_ctx.info("ApprovedImage has status.pcrs and events");
 
-//     backend.cleanup().await?;
-//     test_ctx.cleanup().await?;
-//     Ok(())
-// }
-// }
+    // --- Operator version ---
+
+    let tec = tec_api.get(TEC_NAME).await?;
+    let new_version = tec.status.as_ref()
+        .and_then(|s| s.observed_operator_version.as_deref());
+    assert!(new_version.is_some(), "observedOperatorVersion should be set after upgrade");
+    test_ctx.info(format!("observedOperatorVersion: {new_version:?}"));
+
+    // --- Post-upgrade attestation ---
+    // Rebooting the VM forces a fresh attestation cycle against the new
+    // Trustee v0.20.0. Success proves that resource policy (resource.rego),
+    // attestation policy (tpm.rego), reference values, LUKS keys, and
+    // attestation keys were all correctly synced to the KBS API.
+    let boot_id = backend.get_boot_id().await?;
+    let _reboot = backend.ssh_exec("sudo systemctl reboot").await;
+    test_ctx.info("Rebooting VM post-upgrade");
+    backend.wait_for_vm_ssh_ready(scaled_timeout(300), Some(&boot_id)).await?;
+
+    assert!(backend.verify_encrypted_root(root_key.as_deref()).await?,
+        "VM should attest against Trustee v0.20.0 after upgrade");
+    test_ctx.info("Post-upgrade attestation verified (Trustee v0.20.0)");
+
+    backend.cleanup().await?;
+    test_ctx.cleanup().await?;
+    Ok(())
+}
+}

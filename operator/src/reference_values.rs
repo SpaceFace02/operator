@@ -10,10 +10,10 @@ use k8s_openapi::api::{
     batch::v1::{Job, JobSpec},
     core::v1::{Container, ImageVolumeSource, Pod, PodSpec, PodTemplateSpec, Volume, VolumeMount},
 };
-use kube::api::{DeleteParams, ListParams, ObjectMeta, Patch, PatchParams};
+use kube::api::{DeleteParams, ListParams, ObjectMeta, Patch};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::{finalizer, finalizer::Event};
-use kube::runtime::{reflector::ObjectRef, watcher};
+use kube::runtime::watcher;
 use kube::{Api, Client, Resource};
 use log::{info, warn};
 use oci_client::secrets::RegistryAuth;
@@ -24,7 +24,7 @@ use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use crate::COMPONENT_VERSION;
-use crate::trustee::{self, get_image_pcrs};
+use crate::trustee;
 use operator::{ControllerError, KIND_LABEL_KEY, LONG_REQUEUE, OperatorContext, upsert_condition};
 use operator::{controller_error_policy, controller_info, create_or_info_if_exists};
 use trusted_cluster_operator_lib::{conditions::*, reference_values::*, *};
@@ -37,13 +37,6 @@ const PCR_COMPUTING_REQUEUE: Duration = Duration::from_secs(30);
 const PCR_LABEL: &str = "org.coreos.pcrs";
 /// Finalizer name to discard reference values when an image is no longer approved
 const APPROVED_IMAGE_FINALIZER: &str = "finalizer.approved-image.trusted-execution-clusters.io";
-
-fn cached_image_pcrs(ctx: &OperatorContext) -> Result<ImagePcrs> {
-    let obj_ref = ObjectRef::new(PCR_CONFIG_MAP).within(ctx.client.default_namespace());
-    let err_ctx = format!("missing ConfigMap {PCR_CONFIG_MAP}");
-    let cm = ctx.cm_store.get(&obj_ref).context(err_ctx)?;
-    get_image_pcrs(cm.as_ref())
-}
 
 /// Synchronize with compute_pcrs_cli::Output
 #[derive(Deserialize)]
@@ -116,8 +109,7 @@ async fn job_reconcile(
     // Foreground deletion: Delete the pod too
     let delete = jobs.delete(name, &DeleteParams::foreground()).await;
     delete.map_err(Into::<anyhow::Error>::into)?;
-    let image_pcrs = cached_image_pcrs(&ctx)?;
-    trustee::update_reference_values(&ctx, image_pcrs).await?;
+    trustee::update_reference_values(&ctx).await?;
     Ok(LONG_REQUEUE)
 }
 
@@ -442,7 +434,7 @@ pub async fn handle_new_image(
         .as_ref()
         .and_then(|s| s.first_seen.clone())
         .or_else(|| Some(chrono::Utc::now().to_rfc3339()));
-    let images: Api<ApprovedImage> = Api::default_namespaced(client.clone());
+    let images: Api<ApprovedImage> = Api::default_namespaced(ctx.client.clone());
     let status = ApprovedImageStatus {
         conditions,
         pcrs: Some(status_pcrs),
@@ -450,14 +442,14 @@ pub async fn handle_new_image(
     };
     update_status!(images, resource_name, status)?;
 
-    trustee::update_reference_values(client)
+    trustee::update_reference_values(ctx)
         .await
         .map(|_| COMMITTED_REASON)
 }
 
-pub async fn disallow_image(client: Client, resource_name: &str) -> Result<()> {
+pub async fn disallow_image(ctx: &OperatorContext, resource_name: &str) -> Result<()> {
     info!("Disallowing image {resource_name}, recomputing reference values");
-    trustee::update_reference_values(client).await
+    trustee::update_reference_values(ctx).await
 }
 
 #[cfg(test)]
