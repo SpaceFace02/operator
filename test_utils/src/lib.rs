@@ -511,7 +511,7 @@ impl TestContext {
         test_name: &str,
         delayed_approved_image: bool,
         approved_images: &[(&str, &str)],
-        image_overrides: &[(&str, &str)],
+        container_image_overrides: &[(&str, &str)],
     ) -> Result<Self> {
         INIT.call_once(|| {
             let _ = env_logger::builder().is_test(true).try_init();
@@ -533,7 +533,7 @@ impl TestContext {
         ctx.manifests_dir = manifests_dir;
 
         ctx.create_namespace().await?;
-        ctx.apply_operator_manifests(approved_images, image_overrides)
+        ctx.apply_operator_manifests(approved_images, container_image_overrides)
             .await?;
 
         test_info!(&ctx.test_name, "Execute test in the namespace {namespace}");
@@ -560,17 +560,22 @@ impl TestContext {
     pub async fn cleanup(&self) -> Result<()> {
         self.delete_trusted_execution_cluster().await?;
         let timeout = scaled_duration(60);
+        self.info("Checking for resources and finalizer secrets");
         let msg = format!("Resources were left behind after {timeout:?}");
         let poller = Poller::new().with_timeout(timeout).with_error_message(msg);
         let chk = || async move {
             self.check_no_resources::<AttestationKey>().await?;
             self.check_no_resources::<ApprovedImage>().await?;
             self.check_no_resources::<Machine>().await?;
+            self.check_no_finalizer_secrets().await?;
             Ok::<_, anyhow::Error>(())
         };
         poller.poll_async(chk).await?;
+        self.info("Checks completed: No resources or finalizer secrets found");
         self.cleanup_namespace().await?;
+        self.info(format!("Namespace {} deleted", self.test_namespace));
         self.cleanup_manifests_dir()?;
+        self.info(format!("Manifests directory {} deleted", self.manifests_dir));
         Ok(())
     }
 
@@ -601,6 +606,28 @@ impl TestContext {
         let list = api.list(&Default::default()).await?;
         if let Some(item) = list.items.first() {
             return Err(anyhow!("Resource still present: {item:?}"));
+        }
+        Ok(())
+    }
+
+    async fn check_no_finalizer_secrets(&self) -> Result<()> {
+        const AK_FINALIZER: &str =
+            "trusted-execution-clusters.io/attestationkey-secret-finalizer";
+        let api: Api<Secret> = Api::namespaced(self.client.clone(), &self.test_namespace);
+        for secret in api.list(&Default::default()).await? {
+            let name = secret.metadata.name.as_deref().unwrap_or("?");
+            let has_ak_finalizer = secret
+                .metadata
+                .finalizers
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|f| f == AK_FINALIZER);
+            if has_ak_finalizer {
+                return Err(anyhow!(
+                    "Secret {name} still has {AK_FINALIZER}"
+                ));
+            }
         }
         Ok(())
     }
@@ -857,7 +884,7 @@ impl TestContext {
         &self,
         workspace_root: &PathBuf,
         approved_images: &[(&str, &str)],
-        image_overrides: &[(&str, &str)],
+        container_image_overrides: &[(&str, &str)],
     ) -> Result<(PathBuf, PathBuf)> {
         let ns = self.test_namespace.clone();
         let controller_gen_pattern = workspace_root.join("bin/controller-gen-*");
@@ -904,7 +931,7 @@ impl TestContext {
         }
         let repo = env::var("REGISTRY").unwrap_or_else(|_| "localhost:5000".to_string());
         let tag = env::var("TAG").unwrap_or_else(|_| "latest".to_string());
-        let lookup = |key: &str| image_overrides.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string());
+        let lookup = |key: &str| container_image_overrides.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string());
         let trustee_image = lookup("TRUSTEE_IMAGE")
             .map_or_else(|| get_env("TRUSTEE_IMAGE"), Ok)?;
         let approved_image = get_env("APPROVED_IMAGE")?;
@@ -952,7 +979,7 @@ impl TestContext {
     async fn apply_operator_manifests(
         &self,
         approved_images: &[(&str, &str)],
-        image_overrides: &[(&str, &str)],
+        container_image_overrides: &[(&str, &str)],
     ) -> Result<()> {
         let manifests_dir = &self.manifests_dir;
         self.info(format!("Generating manifests in {manifests_dir}"));
@@ -961,7 +988,7 @@ impl TestContext {
             .map(PathBuf::from)
             .unwrap_or(env::current_dir()?.join(".."));
         let (crd_temp_dir, rbac_temp_dir) = self
-            .generate_manifests(&workspace_root, approved_images, image_overrides)
+            .generate_manifests(&workspace_root, approved_images, container_image_overrides)
             .await?;
         self.info("Manifests generated successfully");
 
@@ -1276,9 +1303,9 @@ macro_rules! virt_test {
 macro_rules! setup {
     () => {{ $crate::TestContext::new(TEST_NAME, false, &[]) }};
     (delayed_approved_image) => {{ $crate::TestContext::new(TEST_NAME, true, &[]) }};
-    ($images:expr) => {{ $crate::TestContext::new(TEST_NAME, false, &$images) }};
-    (images: $overrides:expr) => {{ $crate::TestContext::new_with_image_overrides(TEST_NAME, false, &[], &$overrides) }};
-    ($images:expr, images: $overrides:expr) => {{ $crate::TestContext::new_with_image_overrides(TEST_NAME, false, &$images, &$overrides) }};
+    ($approved_images:expr) => {{ $crate::TestContext::new(TEST_NAME, false, &$approved_images) }};
+    (container_images: $overrides:expr) => {{ $crate::TestContext::new_with_image_overrides(TEST_NAME, false, &[], &$overrides) }};
+    ($approved_images:expr, container_images: $overrides:expr) => {{ $crate::TestContext::new_with_image_overrides(TEST_NAME, false, &$approved_images, &$overrides) }};
 }
 
 async fn setup_test_client() -> Result<Client> {

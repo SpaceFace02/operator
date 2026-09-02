@@ -8,8 +8,6 @@ cfg_if::cfg_if! {
 if #[cfg(feature = "virtualization")] {
 
 use anyhow::Context;
-use compute_pcrs_lib::Pcr;
-use compute_pcrs_lib::tpmevents::{TPMEvent, TPMEventID};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
 use kube::api::{ListParams, Patch, PatchParams};
@@ -127,18 +125,6 @@ fn extract_events(img: &ApprovedImage) -> Vec<(i64, Vec<ApprovedImageStatusPcrsE
         .unwrap_or_default()
 }
 
-fn approved_image_was_invalidated(img: Option<&ApprovedImage>) -> bool {
-    img.and_then(|i| i.status.as_ref())
-        .and_then(|s| s.conditions.as_ref())
-        .is_some_and(|cs| {
-            cs.iter().any(|c| {
-                c.type_ == COMMITTED_CONDITION
-                    && c.status == "False"
-                    && c.reason == NOT_COMMITTED_REASON_COMPUTING
-            })
-        })
-}
-
 fn extract_pcr_vals(img: &ApprovedImage) -> Vec<(i64, String)> {
     img.status
         .as_ref()
@@ -147,18 +133,34 @@ fn extract_pcr_vals(img: &ApprovedImage) -> Vec<(i64, String)> {
         .unwrap_or_default()
 }
 
-const OLD_OPERATOR_IMAGE: &str = "quay.io/trusted-execution-clusters/trusted-cluster-operator:v0.2.2";
-const OLD_TRUSTEE_IMAGE: &str = "quay.io/trusted-execution-clusters/key-broker-service:v0.17.0";
-const OLD_REG_SERVER_IMAGE: &str = "quay.io/trusted-execution-clusters/registration-server:v0.2.2";
-const OLD_AK_REGISTER_IMAGE: &str = "quay.io/trusted-execution-clusters/attestation-key-register:v0.2.2";
-const OLD_COMPUTE_PCRS_IMAGE: &str = "quay.io/trusted-execution-clusters/compute-pcrs:v0.2.2";
+fn old_image(component: &str) -> String {
+    let registry = std::env::var("UPGRADE_OLD_REGISTRY")
+        .unwrap_or_else(|_| "quay.io/trusted-execution-clusters".into());
+    let tag = std::env::var("UPGRADE_OLD_TAG").unwrap_or_else(|_| "v0.2.2".into());
+    format!("{registry}/{component}:{tag}")
+}
 
-const CURRENT_TAG: &str = "upgrade-mock";
-const CURRENT_OPERATOR_IMAGE: &str = "quay.io/trusted-execution-clusters/trusted-cluster-operator:upgrade-mock";
-const CURRENT_TRUSTEE_IMAGE: &str = "quay.io/trusted-execution-clusters/key-broker-service:v0.20.0";
-const CURRENT_REG_SERVER_IMAGE: &str = "quay.io/trusted-execution-clusters/registration-server:upgrade-mock";
-const CURRENT_AK_REGISTER_IMAGE: &str = "quay.io/trusted-execution-clusters/attestation-key-register:upgrade-mock";
-const CURRENT_COMPUTE_PCRS_IMAGE: &str = "quay.io/trusted-execution-clusters/compute-pcrs:upgrade-mock";
+fn old_trustee_image() -> String {
+    let registry = std::env::var("UPGRADE_OLD_REGISTRY")
+        .unwrap_or_else(|_| "quay.io/trusted-execution-clusters".into());
+    let tag = std::env::var("UPGRADE_OLD_TRUSTEE_TAG").unwrap_or_else(|_| "v0.17.0".into());
+    format!("{registry}/key-broker-service:{tag}")
+}
+
+fn current_image(component: &str) -> String {
+    let registry = std::env::var("REGISTRY").unwrap_or_else(|_| "localhost:5000".into());
+    let tag = std::env::var("TAG").unwrap_or_else(|_| "latest".into());
+    format!("{registry}/{component}:{tag}")
+}
+
+fn current_tag() -> String {
+    std::env::var("TAG").unwrap_or_else(|_| "latest".into())
+}
+
+fn current_trustee_image() -> String {
+    std::env::var("TRUSTEE_IMAGE")
+        .unwrap_or_else(|_| "quay.io/trusted-execution-clusters/key-broker-service:v0.20.0".into())
+}
 
 /// Patches the operator Deployment image and RELATED_IMAGE_* env vars in
 /// a single strategic merge patch and waits for the rollout.
@@ -205,121 +207,25 @@ async fn patch_operator_with_images(
 }
 }
 
-// Test 1: Multi-image upgrade with event and PCR verification.
-// Approves two images, verifies their events, triggers upgrade, checks
-// that events survive the invalidation-recommit cycle and PCRs are identical.
-virt_test! {
-async fn test_upgrade_combined_pcrs_events() -> anyhow::Result<()> {
-    let test_ctx = setup!(
-        [(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_REF)],
-        images: [
-            ("OPERATOR_IMAGE", CURRENT_OPERATOR_IMAGE),
-            ("TRUSTEE_IMAGE", CURRENT_TRUSTEE_IMAGE),
-            (RELATED_IMAGE_REGISTRATION_SERVER, CURRENT_REG_SERVER_IMAGE),
-            (RELATED_IMAGE_ATTESTATION_KEY_REGISTER, CURRENT_AK_REGISTER_IMAGE),
-            (RELATED_IMAGE_COMPUTE_PCRS, CURRENT_COMPUTE_PCRS_IMAGE),
-        ]
-    ).await?;
-    let client = test_ctx.client();
-    let namespace = test_ctx.namespace();
-
-    let tec_api: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
-    let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
-
-    wait_for_install(&tec_api, TEC_NAME).await?;
-    for name in [APPROVED_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME] {
-        wait_for_committed_with_pcrs(&images, name, 300).await?;
-    }
-    test_ctx.info("Both ApprovedImages committed with PCRs");
-
-    // Verify events on primary image.
-    let primary = images.get(APPROVED_IMAGE_NAME).await?;
-    let primary_events = extract_events(&primary);
-    assert!(!primary_events.is_empty(), "Primary image should have events");
-    for (pcr_id, events) in &primary_events {
-        for ev in events {
-            assert!(!ev.name.is_empty(), "PCR {pcr_id} event should have a name");
-            assert!(!ev.hash.is_empty(), "PCR {pcr_id} event should have a hash");
-            assert!(!ev.id.is_empty(), "PCR {pcr_id} event should have an id");
-        }
-    }
-    test_ctx.info("Primary image events verified");
-
-    let secondary = images.get(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME).await?;
-    let secondary_events = extract_events(&secondary);
-    assert!(!secondary_events.is_empty(), "Secondary image should have events");
-    test_ctx.info("Secondary image events verified");
-
-    let pre_primary_pcr_vals = extract_pcr_vals(&primary);
-    let pre_secondary_pcr_vals = extract_pcr_vals(&secondary);
-
-    // Trigger upgrade.
-    trigger_upgrade(&tec_api, TEC_NAME).await?;
-    test_ctx.info("Triggered upgrade");
-
-    for name in [APPROVED_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME] {
-        let done = await_condition(images.clone(), name, approved_image_was_invalidated);
-        timeout(scaled_duration(60), done)
-            .await
-            .context(format!("{name} should be invalidated during upgrade"))??;
-    }
-    test_ctx.info("Both images invalidated");
-
-    let done = await_condition(
-        tec_api.clone(),
-        TEC_NAME,
-        tec_has_condition_reason(UPGRADE_CONDITION, UPGRADE_COMPLETE),
-    );
-    timeout(scaled_duration(300), done)
-        .await
-        .context("waiting for Upgrade=Complete")??;
-    test_ctx.info("Upgrade completed");
-
-    for name in [APPROVED_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME] {
-        wait_for_committed_with_pcrs(&images, name, 300).await?;
-    }
-    test_ctx.info("Both images recommitted");
-
-    // Verify events survived the invalidation-recommit cycle.
-    let post_primary = images.get(APPROVED_IMAGE_NAME).await?;
-    let post_primary_events = extract_events(&post_primary);
-    assert_eq!(
-        primary_events.len(), post_primary_events.len(),
-        "Primary image should have same number of PCR entries"
-    );
-    for (pcr_id, events) in &post_primary_events {
-        assert!(!events.is_empty(), "PCR {pcr_id} events should be repopulated");
-    }
-
-    let post_secondary = images.get(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME).await?;
-    assert!(!extract_events(&post_secondary).is_empty(), "Secondary events should be repopulated");
-    test_ctx.info("Events preserved after upgrade");
-
-    // Verify PCR values are identical (same images produce same PCRs).
-    assert_eq!(pre_primary_pcr_vals, extract_pcr_vals(&post_primary), "Primary PCRs should be identical");
-    assert_eq!(pre_secondary_pcr_vals, extract_pcr_vals(&post_secondary), "Secondary PCRs should be identical");
-
-    test_ctx.verify_expected_pcrs(&[&primary_pcrs!(), &secondary_pcrs!()]).await?;
-    test_ctx.info("PCR values verified");
-
-    test_ctx.cleanup().await?;
-    Ok(())
-}
-}
-
-// Test 2: Upgrade failure -- VM still attests against surviving Trustee.
+// Test 1: Upgrade failure -- VM still attests against surviving Trustee.
 // Injects a bad Trustee image via the operator's env var, triggers upgrade,
 // verifies the Upgrade=Failed condition, then confirms the VM can reboot
 // and still attest against the old Trustee pod.
 virt_test! {
 async fn test_upgrade_failure_vm_still_attests() -> anyhow::Result<()> {
-    let test_ctx = setup!(images: [
-        ("OPERATOR_IMAGE", CURRENT_OPERATOR_IMAGE),
-        ("TRUSTEE_IMAGE", CURRENT_TRUSTEE_IMAGE),
-        (RELATED_IMAGE_REGISTRATION_SERVER, CURRENT_REG_SERVER_IMAGE),
-        (RELATED_IMAGE_ATTESTATION_KEY_REGISTER, CURRENT_AK_REGISTER_IMAGE),
-        (RELATED_IMAGE_COMPUTE_PCRS, CURRENT_COMPUTE_PCRS_IMAGE),
-    ]).await?;
+    let cur_operator = current_image("trusted-cluster-operator");
+    let cur_trustee = current_trustee_image();
+    let cur_reg_srv = current_image("registration-server");
+    let cur_ak_reg = current_image("attestation-key-register");
+    let cur_compute = current_image("compute-pcrs");
+    let image_overrides = [
+        ("OPERATOR_IMAGE", cur_operator.as_str()),
+        ("TRUSTEE_IMAGE", cur_trustee.as_str()),
+        (RELATED_IMAGE_REGISTRATION_SERVER, cur_reg_srv.as_str()),
+        (RELATED_IMAGE_ATTESTATION_KEY_REGISTER, cur_ak_reg.as_str()),
+        (RELATED_IMAGE_COMPUTE_PCRS, cur_compute.as_str()),
+    ];
+    let test_ctx = setup!(container_images: image_overrides).await?;
     let client = test_ctx.client();
     let namespace = test_ctx.namespace();
 
@@ -440,7 +346,7 @@ async fn test_upgrade_failure_vm_still_attests() -> anyhow::Result<()> {
 }
 }
 
-// Test 3: Real version upgrade (operator v0.2.2 -> upgrade-mock, Trustee v0.17.0 -> v0.20.0).
+// Test 2: Real version upgrade (operator v0.2.2 -> v0.2.3, Trustee v0.17.0 -> v0.20.0).
 // v0.2.2 stored PCRs in a ConfigMap; upgrade-mock stores them in ApprovedImage status.
 // Verifies the ConfigMap approach works pre-upgrade, then after upgrade verifies
 // Trustee is rebuilt from scratch (secret, config present), ApprovedImage.status.pcrs
@@ -448,13 +354,19 @@ async fn test_upgrade_failure_vm_still_attests() -> anyhow::Result<()> {
 virt_test! {
 async fn test_real_version_upgrade() -> anyhow::Result<()> {
     // Phase 1: Deploy with old operator binary and old component images.
-    let test_ctx = setup!(images: [
-        ("OPERATOR_IMAGE", OLD_OPERATOR_IMAGE),
-        ("TRUSTEE_IMAGE", OLD_TRUSTEE_IMAGE),
-        (RELATED_IMAGE_REGISTRATION_SERVER, OLD_REG_SERVER_IMAGE),
-        (RELATED_IMAGE_ATTESTATION_KEY_REGISTER, OLD_AK_REGISTER_IMAGE),
-        (RELATED_IMAGE_COMPUTE_PCRS, OLD_COMPUTE_PCRS_IMAGE),
-    ]).await?;
+    let old_operator = old_image("trusted-cluster-operator");
+    let old_trustee = old_trustee_image();
+    let old_reg_srv = old_image("registration-server");
+    let old_ak_reg = old_image("attestation-key-register");
+    let old_compute = old_image("compute-pcrs");
+    let image_overrides = [
+        ("OPERATOR_IMAGE", old_operator.as_str()),
+        ("TRUSTEE_IMAGE", old_trustee.as_str()),
+        (RELATED_IMAGE_REGISTRATION_SERVER, old_reg_srv.as_str()),
+        (RELATED_IMAGE_ATTESTATION_KEY_REGISTER, old_ak_reg.as_str()),
+        (RELATED_IMAGE_COMPUTE_PCRS, old_compute.as_str()),
+    ];
+    let test_ctx = setup!(container_images: image_overrides).await?;
     let client = test_ctx.client();
     let namespace = test_ctx.namespace();
 
@@ -511,16 +423,22 @@ async fn test_real_version_upgrade() -> anyhow::Result<()> {
         "VM should attest with Trustee v0.17.0");
     test_ctx.info("Pre-upgrade attestation verified (Trustee v0.17.0)");
 
-    // Phase 2: Upgrade v0.2.2 -> upgrade-mock (Trustee v0.17.0 -> v0.20.0).
+    // Phase 2: Upgrade v0.2.2 -> current (Trustee v0.17.0 -> v0.20.0).
+    let cur_operator = current_image("trusted-cluster-operator");
+    let cur_trustee = current_trustee_image();
+    let cur_reg_srv = current_image("registration-server");
+    let cur_ak_reg = current_image("attestation-key-register");
+    let cur_compute = current_image("compute-pcrs");
+    let cur_tag = current_tag();
     patch_operator_with_images(
         &deployments,
-        CURRENT_OPERATOR_IMAGE,
-        CURRENT_TRUSTEE_IMAGE,
-        CURRENT_REG_SERVER_IMAGE,
-        CURRENT_AK_REGISTER_IMAGE,
-        CURRENT_COMPUTE_PCRS_IMAGE,
+        &cur_operator,
+        &cur_trustee,
+        &cur_reg_srv,
+        &cur_ak_reg,
+        &cur_compute,
     ).await?;
-    test_ctx.info("Operator upgraded from v0.2.2 to upgrade-mock");
+    test_ctx.info("Operator upgraded from v0.2.2 to current");
 
     // Phase 3: Verify the upgrade completes.
     let done = await_condition(
@@ -540,11 +458,11 @@ async fn test_real_version_upgrade() -> anyhow::Result<()> {
 
     // Verify component images upgraded.
     let post_reg = deployment_image(&deployments.get(REGISTER_SERVER_DEPLOYMENT).await?).unwrap();
-    assert!(post_reg.contains(CURRENT_TAG),
-        "register-server should be {CURRENT_TAG}, got: {post_reg}");
+    assert!(post_reg.contains(&cur_tag),
+        "register-server should be {cur_tag}, got: {post_reg}");
     let post_ak = deployment_image(&deployments.get(ATTESTATION_KEY_REGISTER_DEPLOYMENT).await?).unwrap();
-    assert!(post_ak.contains(CURRENT_TAG),
-        "ak-register should be {CURRENT_TAG}, got: {post_ak}");
+    assert!(post_ak.contains(&cur_tag),
+        "ak-register should be {cur_tag}, got: {post_ak}");
     test_ctx.info(format!("Post-upgrade images: reg={post_reg}, ak={post_ak}"));
 
     // --- Trustee rebuilt from scratch: verify all infrastructure ---
@@ -611,6 +529,8 @@ async fn test_real_version_upgrade() -> anyhow::Result<()> {
     let boot_id = backend.get_boot_id().await?;
     let _reboot = backend.ssh_exec("sudo systemctl reboot").await;
     test_ctx.info("Rebooting VM post-upgrade");
+
+    // verifies attestation policies, reference values, LUKS keys, and attestation keys were all correctly synced to the KBS API.
     backend.wait_for_vm_ssh_ready(scaled_timeout(300), Some(&boot_id)).await?;
 
     assert!(backend.verify_encrypted_root(root_key.as_deref()).await?,

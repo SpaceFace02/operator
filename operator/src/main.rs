@@ -10,13 +10,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use env_logger::Env;
 use futures_util::StreamExt;
-use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::reflector;
 use kube::runtime::watcher;
-use kube::api::DeleteParams;
 use kube::{Api, Client};
 use log::{info, warn};
 
@@ -24,8 +23,8 @@ use operator::OperatorContext;
 use operator::{generate_owner_reference, spawn_reflector, sync_cache, upsert_condition};
 use trusted_cluster_operator_lib::endpoints::*;
 use trusted_cluster_operator_lib::{
-    ApprovedImage, ApprovedImageStatus, AttestationKey, Machine, TrustedExecutionCluster, TrustedExecutionClusterStatus,
-    committed_condition,
+    ApprovedImage, ApprovedImageStatus, AttestationKey, Machine, TrustedExecutionCluster,
+    TrustedExecutionClusterStatus, committed_condition,
 };
 use trusted_cluster_operator_lib::{conditions::*, images::*, update_status};
 
@@ -106,6 +105,7 @@ async fn reconcile(
                 }
             )?;
         }
+
         return Ok(LONG_REQUEUE);
     }
 
@@ -146,9 +146,10 @@ async fn reconcile(
         // A previous upgrade failed and requires manual intervention;
         // do not retry automatically.
         // TODO: Add a retry count before giving up and requiring manual intervention.
-        let has_failed = conditions
-            .as_ref()
-            .is_some_and(|cs| cs.iter().any(|c| c.type_ == UPGRADE_CONDITION && c.reason == UPGRADE_FAILED));
+        let has_failed = conditions.as_ref().is_some_and(|cs| {
+            cs.iter()
+                .any(|c| c.type_ == UPGRADE_CONDITION && c.reason == UPGRADE_FAILED)
+        });
         if has_failed {
             return Ok(LONG_REQUEUE);
         }
@@ -171,14 +172,8 @@ async fn reconcile(
         };
         update_status!(clusters, name, status)?;
 
-        let upgrade_result = run_upgrade(
-            &ctx,
-            &cluster,
-            &mut conditions,
-            generation,
-            existing_status,
-        )
-        .await;
+        let upgrade_result =
+            run_upgrade(&ctx, &cluster, &mut conditions, generation, existing_status).await;
 
         if let Err(e) = upgrade_result {
             warn!("Upgrade failed: {e:?}. Setting Upgrade=Failed.");
@@ -379,25 +374,28 @@ async fn converge_trustee(
             live_image.unwrap_or("<none>")
         );
 
-        // Trustee is stateful (auth keys, volume layout, config) and may
-        // have changed significantly across versions. Delete stale
-        // resources and reinstall from scratch so that the config,
-        // secrets, volumes, and pod spec match the current operator.
-        deployments
-            .delete(TRUSTEE_DEPLOYMENT, &DeleteParams::default())
-            .await
-            .context("Failed to delete old Trustee Deployment")?;
-        let configmaps: Api<ConfigMap> = Api::default_namespaced(client.clone());
-        if configmaps.get_opt(trustee::TRUSTEE_DATA_MAP).await?.is_some() {
-            configmaps
-                .delete(trustee::TRUSTEE_DATA_MAP, &DeleteParams::default())
-                .await
-                .context("Failed to delete old trustee-data ConfigMap")?;
-        }
-        info!("Deleted old Trustee resources for fresh reinstall");
+        // Patch config and the Deployment in place. Do not delete the
+        // Deployment or trustee-data ConfigMap: old pods mount that
+        // ConfigMap, and RollingUpdate (maxUnavailable=0) keeps them
+        // serving if the new image never becomes Ready.
+        let owner_reference = generate_owner_reference(cluster)?;
+        let trustee_secret = &cluster.spec.trustee_secret;
 
-        install_trustee_configuration(client.clone(), cluster).await?;
-        info!("Reinstalled Trustee from scratch");
+        trustee::generate_trustee_data(client.clone(), owner_reference.clone(), trustee_secret)
+            .await
+            .context("Failed to apply KBS configuration")?;
+        trustee::generate_trustee_auth_keys_secret(client.clone(), owner_reference.clone())
+            .await
+            .context("Failed to create auth keys")?;
+        trustee::apply_kbs_deployment(
+            client.clone(),
+            owner_reference,
+            &desired_image,
+            trustee_secret,
+        )
+        .await
+        .context("Failed to apply Trustee Deployment")?;
+        info!("Trustee resources updated for upgrade to {desired_image}");
     }
 
     wait_for_deployment_available(client, TRUSTEE_DEPLOYMENT)
@@ -414,7 +412,7 @@ async fn converge_trustee(
         .map_err(|e| anyhow!("{e}"))
         .context("Failed to sync Trustee API state after upgrade")?;
 
-    info!("Trustee upgrade complete: reinstalled from scratch, API state synced");
+    info!("Trustee upgrade complete: API state synced");
     Ok(())
 }
 
@@ -897,7 +895,10 @@ mod tests {
         count_check!(0, clos2, |client| {
             let mut cluster = dummy_cluster();
             cluster.metadata.deletion_timestamp = Some(Time(Timestamp::now()));
-            cluster.status = Some(TrustedExecutionClusterStatus { conditions, observed_operator_version: None });
+            cluster.status = Some(TrustedExecutionClusterStatus {
+                conditions,
+                observed_operator_version: None,
+            });
             reconcile(Arc::new(cluster), Arc::new(OperatorContext::new(client)))
                 .await
                 .unwrap();
@@ -989,10 +990,12 @@ mod tests {
                 let depl = make_deployment(TRUSTEE_DEPLOYMENT, "0.1.0");
                 Ok(serde_json::to_string(&depl).unwrap())
             }
-            // generate_trustee_data: create_or_info_if_exists ConfigMap POST -- fail
-            (2, &Method::POST) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+            // generate_trustee_data: ConfigMap already exists
+            (2, &Method::GET) => Ok(serde_json::to_string(&ConfigMap::default()).unwrap()),
+            // generate_trustee_data: patch ConfigMap -- fail
+            (3, &Method::PATCH) => Err(StatusCode::INTERNAL_SERVER_ERROR),
             // Final Upgrade=Failed status patch
-            (3, &Method::PATCH) => {
+            (4, &Method::PATCH) => {
                 let body = get_body_string(req).await;
                 assert!(
                     body.contains(UPGRADE_FAILED),
@@ -1007,7 +1010,7 @@ mod tests {
             _ => panic!("unexpected API interaction: {req:?}, counter {ctr}"),
         };
 
-        count_check!(4, clos, |client| {
+        count_check!(5, clos, |client| {
             let mut cluster = dummy_cluster();
             cluster.status = Some(TrustedExecutionClusterStatus {
                 conditions: Some(vec![installed]),

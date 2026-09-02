@@ -12,8 +12,8 @@ use k8s_openapi::api::{
 };
 use kube::api::{DeleteParams, ListParams, ObjectMeta, Patch};
 use kube::runtime::controller::{Action, Controller};
-use kube::runtime::{finalizer, finalizer::Event};
 use kube::runtime::watcher;
+use kube::runtime::{finalizer, finalizer::Event};
 use kube::{Api, Client, Resource};
 use log::{info, warn};
 use oci_client::secrets::RegistryAuth;

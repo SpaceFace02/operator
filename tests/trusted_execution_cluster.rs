@@ -9,18 +9,19 @@ use chrono::Utc;
 use compute_pcrs_lib::Pcr;
 use compute_pcrs_lib::tpmevents::{TPMEvent, TPMEventID};
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret};
 use k8s_openapi::api::core::v1::{Pod, Secret};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta, OwnerReference};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, OwnerReference};
 use kube::api::{ListParams, LogParams, Patch, PatchParams};
 use kube::runtime::wait::await_condition;
 use kube::{Api, api::DeleteParams};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::timeout;
-use trusted_cluster_operator_lib::conditions::NOT_COMMITTED_REASON_PENDING;
+use trusted_cluster_operator_lib::ApprovedImageStatusPcrsEvents;
+use trusted_cluster_operator_lib::conditions::{
+    NOT_COMMITTED_REASON_COMPUTING, NOT_COMMITTED_REASON_PENDING, UPGRADE_COMPLETE,
+    UPGRADE_CONDITION,
+};
 use trusted_cluster_operator_lib::endpoints::{REGISTER_SERVER_DEPLOYMENT, TRUSTEE_DEPLOYMENT};
 use trusted_cluster_operator_lib::images::RELATED_IMAGE_TRUSTEE;
 use trusted_cluster_operator_lib::{
@@ -885,6 +886,55 @@ async fn trigger_upgrade(tec_api: &Api<TrustedExecutionCluster>, name: &str) -> 
     Ok(())
 }
 
+async fn wait_for_committed_with_pcrs(
+    images: &Api<ApprovedImage>,
+    name: &str,
+    secs: u64,
+) -> anyhow::Result<()> {
+    let done = await_condition(images.clone(), name, |img: Option<&ApprovedImage>| {
+        approved_image_is_committed(img) && approved_image_has_pcrs(img)
+    });
+    timeout(scaled_duration(secs), done)
+        .await
+        .context(format!("waiting for {name} committed with PCRs"))??;
+    Ok(())
+}
+
+fn extract_events(img: &ApprovedImage) -> Vec<(i64, Vec<ApprovedImageStatusPcrsEvents>)> {
+    img.status
+        .as_ref()
+        .and_then(|s| s.pcrs.as_ref())
+        .map(|pcrs| {
+            pcrs.iter()
+                .map(|p| {
+                    let events = p.events.clone().unwrap_or_default();
+                    (p.id, events)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn approved_image_was_invalidated(img: Option<&ApprovedImage>) -> bool {
+    img.and_then(|i| i.status.as_ref())
+        .and_then(|s| s.conditions.as_ref())
+        .is_some_and(|cs| {
+            cs.iter().any(|c| {
+                c.type_ == "Committed"
+                    && c.status == "False"
+                    && c.reason == NOT_COMMITTED_REASON_COMPUTING
+            })
+        })
+}
+
+fn extract_pcr_vals(img: &ApprovedImage) -> Vec<(i64, String)> {
+    img.status
+        .as_ref()
+        .and_then(|s| s.pcrs.as_ref())
+        .map(|pcrs| pcrs.iter().map(|p| (p.id, p.value.clone())).collect())
+        .unwrap_or_default()
+}
+
 named_test! {
 async fn test_upgrade_trigger_and_completion() -> anyhow::Result<()> {
     let test_ctx = setup!().await?;
@@ -1053,7 +1103,7 @@ async fn test_upgrade_no_downtime() -> anyhow::Result<()> {
 }
 
 named_test! {
-async fn test_upgrade_combined_pcrs() -> anyhow::Result<()> {
+async fn test_upgrade_combined_pcrs_events() -> anyhow::Result<()> {
     let test_ctx = setup!([(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_REF)]).await?;
     let client = test_ctx.client();
     let namespace = test_ctx.namespace();
@@ -1061,80 +1111,81 @@ async fn test_upgrade_combined_pcrs() -> anyhow::Result<()> {
     let tec_api: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
     let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
 
-    // Wait for install and both images to be committed
     let done = await_condition(tec_api.clone(), TEC_NAME, tec_has_condition("Installed", "True"));
     timeout(scaled_duration(120), done)
         .await
         .context("waiting for initial install")??;
 
-    // Wait for both ApprovedImages to be committed with PCRs
-    for img_name in [APPROVED_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME] {
-        let done = await_condition(images.clone(), img_name, |img: Option<&ApprovedImage>| {
-            approved_image_is_committed(img) && approved_image_has_pcrs(img)
-        });
-        timeout(scaled_duration(300), done)
-            .await
-            .context(format!("waiting for {img_name} to be committed with PCRs"))??;
+    for name in [APPROVED_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME] {
+        wait_for_committed_with_pcrs(&images, name, 300).await?;
     }
-    test_ctx.info("Both ApprovedImages committed with PCRs before upgrade");
+    test_ctx.info("Both ApprovedImages committed with PCRs");
 
-    // Extract PCR hex values from an ApprovedImage for comparison
-    let extract_pcr_hex = |img: &ApprovedImage| -> Vec<(i64, String)> {
-        img.status
-            .as_ref()
-            .and_then(|s| s.pcrs.as_ref())
-            .map(|pcrs| pcrs.iter().map(|p| (p.id, p.value.clone())).collect())
-            .unwrap_or_default()
-    };
+    let primary = images.get(APPROVED_IMAGE_NAME).await?;
+    let primary_events = extract_events(&primary);
+    assert!(!primary_events.is_empty(), "Primary image should have events");
+    for (pcr_id, events) in &primary_events {
+        for ev in events {
+            assert!(!ev.name.is_empty(), "PCR {pcr_id} event should have a name");
+            assert!(!ev.hash.is_empty(), "PCR {pcr_id} event should have a hash");
+            assert!(!ev.id.is_empty(), "PCR {pcr_id} event should have an id");
+        }
+    }
+    test_ctx.info("Primary image events verified");
 
-    // Record pre-upgrade PCR values for both images
-    let pre_primary = images.get(APPROVED_IMAGE_NAME).await?;
-    let pre_primary_pcrs = extract_pcr_hex(&pre_primary);
-    let pre_secondary = images.get(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME).await?;
-    let pre_secondary_pcrs = extract_pcr_hex(&pre_secondary);
-    test_ctx.info("Recorded pre-upgrade PCR values");
+    let secondary = images.get(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME).await?;
+    let secondary_events = extract_events(&secondary);
+    assert!(!secondary_events.is_empty(), "Secondary image should have events");
+    test_ctx.info("Secondary image events verified");
 
-    // Trigger upgrade
+    let pre_primary_pcr_vals = extract_pcr_vals(&primary);
+    let pre_secondary_pcr_vals = extract_pcr_vals(&secondary);
+
     trigger_upgrade(&tec_api, TEC_NAME).await?;
-    test_ctx.info("Triggered upgrade with 2 ApprovedImages");
+    test_ctx.info("Triggered upgrade");
 
-    // Wait for upgrade to complete
-    let has_version = |tec: Option<&TrustedExecutionCluster>| {
-        tec.and_then(|t| t.status.as_ref())
-            .and_then(|s| s.observed_operator_version.as_ref())
-            .is_some()
-    };
-    let done = await_condition(tec_api.clone(), TEC_NAME, has_version);
-    timeout(scaled_duration(180), done)
-        .await
-        .context("waiting for upgrade to complete")??;
-
-    // Wait for both ApprovedImages to be re-committed with PCRs after invalidation
-    for img_name in [APPROVED_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME] {
-        let done = await_condition(images.clone(), img_name, |img: Option<&ApprovedImage>| {
-            approved_image_is_committed(img) && approved_image_has_pcrs(img)
-        });
-        timeout(scaled_duration(300), done)
+    for name in [APPROVED_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME] {
+        let done = await_condition(images.clone(), name, approved_image_was_invalidated);
+        timeout(scaled_duration(60), done)
             .await
-            .context(format!("waiting for {img_name} to be re-committed after upgrade"))??;
+            .context(format!("{name} should be invalidated during upgrade"))??;
     }
-    test_ctx.info("Both ApprovedImages re-committed with PCRs after upgrade");
+    test_ctx.info("Both images invalidated");
 
-    // Verify PCR values match pre-upgrade (same images, same PCRs expected)
+    let done = await_condition(
+        tec_api.clone(),
+        TEC_NAME,
+        tec_has_condition_reason(UPGRADE_CONDITION, UPGRADE_COMPLETE),
+    );
+    timeout(scaled_duration(300), done)
+        .await
+        .context("waiting for Upgrade=Complete")??;
+    test_ctx.info("Upgrade completed");
+
+    for name in [APPROVED_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME] {
+        wait_for_committed_with_pcrs(&images, name, 300).await?;
+    }
+    test_ctx.info("Both images recommitted");
+
     let post_primary = images.get(APPROVED_IMAGE_NAME).await?;
-    let post_primary_pcrs = extract_pcr_hex(&post_primary);
-    let post_secondary = images.get(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME).await?;
-    let post_secondary_pcrs = extract_pcr_hex(&post_secondary);
+    let post_primary_events = extract_events(&post_primary);
+    assert_eq!(
+        primary_events.len(), post_primary_events.len(),
+        "Primary image should have same number of PCR entries"
+    );
+    for (pcr_id, events) in &post_primary_events {
+        assert!(!events.is_empty(), "PCR {pcr_id} events should be repopulated");
+    }
 
-    assert_eq!(
-        pre_primary_pcrs, post_primary_pcrs,
-        "Primary ApprovedImage PCRs should match after upgrade"
-    );
-    assert_eq!(
-        pre_secondary_pcrs, post_secondary_pcrs,
-        "Secondary ApprovedImage PCRs should match after upgrade"
-    );
-    test_ctx.info("PCR values verified identical after upgrade recomputation");
+    let post_secondary = images.get(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME).await?;
+    assert!(!extract_events(&post_secondary).is_empty(), "Secondary events should be repopulated");
+    test_ctx.info("Events preserved after upgrade");
+
+    assert_eq!(pre_primary_pcr_vals, extract_pcr_vals(&post_primary), "Primary PCRs should be identical");
+    assert_eq!(pre_secondary_pcr_vals, extract_pcr_vals(&post_secondary), "Secondary PCRs should be identical");
+
+    test_ctx.verify_expected_pcrs(&[&primary_pcrs!(), &secondary_pcrs!()]).await?;
+    test_ctx.info("PCR values verified");
 
     test_ctx.cleanup().await?;
     Ok(())
