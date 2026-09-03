@@ -8,8 +8,10 @@ use axum::{http::StatusCode, routing::put, Router};
 use axum_server::tls_openssl::OpenSSLConfig;
 use clap::Parser;
 use env_logger::Env;
+use k8s_openapi::api::core::v1::ObjectReference;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::{Api, Client};
+use kube::runtime::events::{EventType, Recorder, Reporter};
+use kube::{Api, Client, Resource};
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -17,7 +19,8 @@ use uuid::Uuid;
 
 use trusted_cluster_operator_lib::endpoints::ATTESTATION_KEY_REGISTER_RESOURCE;
 use trusted_cluster_operator_lib::{
-    generate_owner_reference, get_trusted_execution_cluster, AttestationKey, AttestationKeySpec,
+    generate_owner_reference, get_trusted_execution_cluster, record_event, AttestationKey,
+    AttestationKeySpec,
 };
 
 #[derive(Parser)]
@@ -32,6 +35,12 @@ struct Args {
     key_path: Option<String>,
 }
 
+#[derive(Clone)]
+struct AppState {
+    client: Client,
+    recorder: Recorder,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct AttestationKeyRegistration {
     /// Public attestation key
@@ -44,10 +53,12 @@ struct AttestationKeyRegistration {
 }
 
 async fn handle_registration(
-    State(client): State<Client>,
+    State(state): State<AppState>,
     Json(registration): Json<AttestationKeyRegistration>,
 ) -> impl IntoResponse {
     info!("Received registration request: {registration:?}");
+    let client = state.client;
+    let recorder = state.recorder;
 
     let internal_error = |e: anyhow::Error| {
         let code = StatusCode::INTERNAL_SERVER_ERROR;
@@ -76,10 +87,23 @@ async fn handle_registration(
         Ok(existing_keys) => {
             for key in existing_keys.items {
                 if key.spec.public_key == registration.public_key {
+                    let key_ref: ObjectReference = key.object_ref(&());
                     let existing_name = key.metadata.name.unwrap_or_default();
                     error!(
                         "Duplicate public key detected: already exists in AttestationKey '{existing_name}'"
                     );
+                    record_event(
+                        &recorder,
+                        &key_ref,
+                        EventType::Warning,
+                        "DuplicateKeyRejected",
+                        format!(
+                            "Duplicate registration attempt for AttestationKey '{existing_name}'"
+                        ),
+                        "Registering",
+                        None,
+                    )
+                    .await;
                     return (
                         StatusCode::CONFLICT,
                         Json(serde_json::json!({
@@ -93,7 +117,7 @@ async fn handle_registration(
         Err(e) => {
             return internal_error(
                 anyhow::Error::from(e).context("Failed to check for existing keys"),
-            )
+            );
         }
     }
 
@@ -113,8 +137,19 @@ async fn handle_registration(
 
     match api.create(&Default::default(), &attestation_key).await {
         Ok(created) => {
+            let created_ref: ObjectReference = created.object_ref(&());
             let name = created.metadata.name.unwrap_or_default();
             info!("Successfully created AttestationKey: {name}",);
+            record_event(
+                &recorder,
+                &created_ref,
+                EventType::Normal,
+                "AttestationKeyRegistered",
+                format!("AttestationKey '{name}' registered"),
+                "Registering",
+                None,
+            )
+            .await;
             let json = Json(serde_json::json!({
                 "status": "success",
             }));
@@ -132,9 +167,17 @@ async fn main() {
     let endpoint = format!("/{ATTESTATION_KEY_REGISTER_RESOURCE}");
     let err = "failed to create Kubernetes client";
     let client = Client::try_default().await.expect(err);
+    let reporter = Reporter {
+        controller: "attestation-key-register".into(),
+        instance: std::env::var("CONTROLLER_POD_NAME").ok(),
+    };
+    let state = AppState {
+        recorder: Recorder::new(client.clone(), reporter),
+        client,
+    };
     let app = Router::new()
         .route(&endpoint, put(handle_registration))
-        .with_state(client);
+        .with_state(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
     let service = app.into_make_service();
 

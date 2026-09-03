@@ -14,6 +14,7 @@ use k8s_openapi::api::core::v1::{ConfigMap, Secret, SecretVolumeSource, Volume, 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use k8s_openapi::jiff::Timestamp;
 use kube::Resource;
+use kube::runtime::events::{Recorder, Reporter};
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::watcher::watcher;
 use kube::{Api, Client, runtime::controller::Action};
@@ -34,6 +35,7 @@ use trusted_cluster_operator_lib::{
 /// Stores give local cache access to avoid repeated API-server reads.
 pub struct OperatorContext {
     pub client: Client,
+    pub recorder: Recorder,
     pub tec_store: Store<TrustedExecutionCluster>,
     pub cm_store: Store<ConfigMap>,
     pub machine_store: Store<Machine>,
@@ -45,8 +47,10 @@ pub struct OperatorContext {
 
 impl OperatorContext {
     pub fn new(client: Client) -> Self {
+        let recorder = new_recorder(client.clone(), "operator");
         Self {
             client,
+            recorder,
             tec_store: reflector::store().0,
             cm_store: reflector::store().0,
             machine_store: reflector::store().0,
@@ -86,6 +90,14 @@ pub async fn controller_info<T: Debug, E: Debug>(res: Result<T, E>) {
         Ok(o) => info!("reconciled {o:?}"),
         Err(e) => info!("reconcile failed: {e:?}"),
     }
+}
+
+pub fn new_recorder(client: Client, controller_name: &str) -> Recorder {
+    let reporter = Reporter {
+        controller: controller_name.into(),
+        instance: std::env::var("CONTROLLER_POD_NAME").ok(),
+    };
+    Recorder::new(client, reporter)
 }
 
 #[macro_export]

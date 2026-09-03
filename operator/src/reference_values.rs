@@ -6,6 +6,7 @@
 use anyhow::{Context, Result, anyhow};
 use compute_pcrs_lib::Pcr;
 use futures_util::StreamExt;
+use k8s_openapi::api::core::v1::ObjectReference;
 use k8s_openapi::{
     api::{
         batch::v1::{Job, JobSpec},
@@ -15,9 +16,14 @@ use k8s_openapi::{
     jiff::Timestamp,
 };
 use kube::api::{DeleteParams, ListParams, ObjectMeta, Patch, PatchParams};
-use kube::runtime::controller::{Action, Controller};
-use kube::runtime::{finalizer, finalizer::Event};
-use kube::runtime::{reflector::ObjectRef, watcher};
+use kube::runtime::{
+    controller::{Action, Controller},
+    events::EventType,
+    finalizer,
+    finalizer::Event,
+    reflector::ObjectRef,
+    watcher,
+};
 use kube::{Api, Client, Resource};
 use log::{info, warn};
 use oci_client::secrets::RegistryAuth;
@@ -31,7 +37,7 @@ use crate::COMPONENT_VERSION;
 use crate::trustee::{self, get_image_pcrs};
 use operator::{ControllerError, KIND_LABEL_KEY, LONG_REQUEUE, OperatorContext, upsert_condition};
 use operator::{controller_error_policy, controller_info, create_or_info_if_exists};
-use trusted_cluster_operator_lib::{conditions::*, reference_values::*, *};
+use trusted_cluster_operator_lib::{conditions::*, record_event, reference_values::*, *};
 
 const APPROVED_IMAGE_ANNOTATION: &str = "approved-image";
 const PCR_COMMAND_NAME: &str = "compute-pcrs";
@@ -136,6 +142,31 @@ async fn job_reconcile(
     delete.map_err(Into::<anyhow::Error>::into)?;
     let image_pcrs = cached_image_pcrs(&ctx)?;
     trustee::update_reference_values(&ctx, image_pcrs).await?;
+    if let Some(owner) = job
+        .metadata
+        .owner_references
+        .as_ref()
+        .and_then(|refs| refs.iter().find(|r| r.kind == "ApprovedImage"))
+    {
+        let image_ref = ObjectReference {
+            api_version: Some(owner.api_version.clone()),
+            kind: Some(owner.kind.clone()),
+            name: Some(owner.name.clone()),
+            namespace: job.metadata.namespace.clone(),
+            uid: Some(owner.uid.clone()),
+            ..Default::default()
+        };
+        record_event(
+            &ctx.recorder,
+            &image_ref,
+            EventType::Normal,
+            "ComputationCompleted",
+            format!("Reference values computed for {}", owner.name),
+            "Computing",
+            None,
+        )
+        .await;
+    }
     Ok(LONG_REQUEUE)
 }
 
@@ -297,10 +328,35 @@ async fn image_add_reconcile(
         info!("TrustedExecutionCluster is being deleted, deferring image processing for {name}");
         return Ok(Action::requeue(Duration::from_secs(5)));
     }
+    let image_ref: ObjectReference = image.object_ref(&());
     let (action, reason) = match handle_new_image(ctx, image).await {
-        Ok(reason) => (LONG_REQUEUE, reason),
+        Ok(reason) => {
+            if reason == NOT_COMMITTED_REASON_COMPUTING {
+                record_event(
+                    &ctx.recorder,
+                    &image_ref,
+                    EventType::Normal,
+                    "ComputationStarted",
+                    format!("PCR computation started for {name}"),
+                    "Computing",
+                    None,
+                )
+                .await;
+            }
+            (LONG_REQUEUE, reason)
+        }
         Err(e) => {
             warn!("PCR computation for {name} failed: {e}");
+            record_event(
+                &ctx.recorder,
+                &image_ref,
+                EventType::Warning,
+                "ComputationFailed",
+                format!("PCR computation for {name} failed: {e}"),
+                "Computing",
+                None,
+            )
+            .await;
             let action = Action::requeue(Duration::from_secs(60));
             (action, NOT_COMMITTED_REASON_FAILED)
         }

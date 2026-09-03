@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+use k8s_openapi::api::core::v1::ObjectReference;
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, PodSpec, PodTemplateSpec, Secret, Service, ServicePort, ServiceSpec,
 };
@@ -15,7 +16,7 @@ use k8s_openapi::apimachinery::pkg::{
 };
 use kube::api::{Patch, PatchParams};
 use kube::runtime::{Controller, controller::Action, reflector::ObjectRef, watcher};
-use kube::runtime::{finalizer, finalizer::Event};
+use kube::runtime::{events::EventType, finalizer, finalizer::Event};
 use kube::{Api, Client, Resource};
 use log::{info, warn};
 use serde_json::json;
@@ -23,7 +24,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use trusted_cluster_operator_lib::conditions::ATTESTATION_KEY_MACHINE_APPROVE;
 use trusted_cluster_operator_lib::endpoints::*;
-use trusted_cluster_operator_lib::{AttestationKey, Machine};
+use trusted_cluster_operator_lib::{AttestationKey, Machine, record_event};
 
 use crate::conditions::{attestation_key_approved_condition, machine_ak_approved_condition};
 use crate::trustee;
@@ -201,6 +202,7 @@ async fn approve_ak(ak: &AttestationKey, machine: &Machine, ctx: &OperatorContex
     let client = &ctx.client;
     let aks: Api<AttestationKey> = Api::default_namespaced(client.clone());
 
+    let machine_name = machine.metadata.name.clone().unwrap_or_default();
     let condition = attestation_key_approved_condition(
         ATTESTATION_KEY_MACHINE_APPROVE,
         ak.metadata.generation,
@@ -217,9 +219,30 @@ async fn approve_ak(ak: &AttestationKey, machine: &Machine, ctx: &OperatorContex
     .await?
     {
         info!("Approved attestation key {name}");
-    }
 
-    let machine_name = machine.metadata.name.clone().unwrap_or_default();
+        let ak_ref: ObjectReference = ak.object_ref(&());
+        let machine_ref: ObjectReference = machine.object_ref(&());
+        record_event(
+            &ctx.recorder,
+            &ak_ref,
+            EventType::Normal,
+            "AttestationKeyApproved",
+            format!("Attestation key {name} approved for machine {machine_name}"),
+            "Approving",
+            Some(machine_ref.clone()),
+        )
+        .await;
+        record_event(
+            &ctx.recorder,
+            &machine_ref,
+            EventType::Normal,
+            "AttestationKeyApproved",
+            format!("Machine {machine_name} matched attestation key {name}"),
+            "Approving",
+            Some(ak_ref),
+        )
+        .await;
+    }
     let has_machine_owner = ak
         .metadata
         .owner_references

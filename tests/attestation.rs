@@ -10,8 +10,11 @@ if #[cfg(feature = "virtualization")] {
 use anyhow::Result;
 use k8s_openapi::api::apps::v1::Deployment;
 use kube::Api;
-use trusted_cluster_operator_lib::Machine;
+use std::time::Duration;
+use trusted_cluster_operator_lib::{AttestationKey, Machine, TrustedExecutionCluster};
+use trusted_cluster_operator_test_utils::constants::APPROVED_IMAGE_NAME;
 use trusted_cluster_operator_test_utils::virt::{self, VmBackend};
+use trusted_cluster_operator_test_utils::{Poller, wait_for_event};
 
 const ENCRYPTED_ROOT_ASSERT: &str = "should have an encrypted root device (attestation failed)";
 const ENCRYPTED_ROOT_WARN: &str = "Backend reports that Machine IDs cannot be correlated to IP \
@@ -253,6 +256,91 @@ async fn test_vm_restart_operator_new() -> anyhow::Result<()> {
     test_ctx.info("Restarted operator deployment");
 
     let att_ctx = SingleAttestationContext::new(vm_name, &test_ctx).await?;
+    att_ctx.cleanup().await?;
+    test_ctx.cleanup().await?;
+    Ok(())
+}
+}
+
+virt_test! {
+async fn test_attestation_events() -> anyhow::Result<()> {
+    let test_ctx = setup!().await?;
+    let client = test_ctx.client();
+    let namespace = test_ctx.namespace();
+
+    let vm_name = "test-coreos-events";
+    let att_ctx = SingleAttestationContext::new(vm_name, &test_ctx).await?;
+
+    test_ctx.info("Verifying encrypted root device");
+    let has_encrypted_root = att_ctx.verify_encrypted_root().await?;
+    assert!(has_encrypted_root, "VM should have an encrypted root device");
+    test_ctx.info("Attestation successful, verifying Kubernetes events");
+
+    let tecs: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
+    let tec = tecs.get("trusted-execution-cluster").await?;
+    let has_ak_register = tec.spec.public_attestation_key_register_addr.is_some();
+
+    let machines: Api<Machine> = Api::namespaced(client.clone(), namespace);
+    let machine_list = machines.list(&Default::default()).await?;
+    let machine_name = machine_list.items.first()
+        .expect("No Machine found in namespace")
+        .metadata
+        .name
+        .as_ref()
+        .expect("Machine should have a name");
+
+    wait_for_event(client, namespace, APPROVED_IMAGE_NAME, "ComputationStarted", scaled_timeout(60)).await?;
+    test_ctx.info("Event ComputationStarted verified");
+
+    wait_for_event(client, namespace, APPROVED_IMAGE_NAME, "ComputationCompleted", scaled_timeout(60)).await?;
+    test_ctx.info("Event ComputationCompleted verified");
+
+    wait_for_event(client, namespace, machine_name, "MachineRegistered", scaled_timeout(60)).await?;
+    test_ctx.info("Event MachineRegistered verified");
+
+    wait_for_event(client, namespace, machine_name, "KeyProvisioned", scaled_timeout(60)).await?;
+    test_ctx.info("Event KeyProvisioned verified");
+
+    if has_ak_register {
+        let aks: Api<AttestationKey> = Api::namespaced(client.clone(), namespace);
+        let ak = Poller::new()
+            .with_timeout(Duration::from_secs(scaled_timeout(60)))
+            .with_error_message("waiting for AttestationKey to be created")
+            .poll_async(|| {
+                let api = aks.clone();
+                async move {
+                    let list = api.list(&Default::default()).await?;
+                    list.items
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("No AttestationKey found yet"))
+                }
+            })
+            .await?;
+        let ak_name = ak.metadata.name.as_ref().expect("AttestationKey should have a name");
+
+        test_ctx.info(format!("Found AttestationKey: {ak_name}"));
+
+        wait_for_event(client, namespace, ak_name, "AttestationKeyRegistered", scaled_timeout(60)).await?;
+        test_ctx.info("Event AttestationKeyRegistered verified");
+
+        wait_for_event(client, namespace, ak_name, "AttestationKeyApproved", scaled_timeout(60)).await?;
+        test_ctx.info("Event AttestationKeyApproved on AttestationKey verified");
+
+        wait_for_event(client, namespace, machine_name, "AttestationKeyApproved", scaled_timeout(60)).await?;
+        test_ctx.info("Event AttestationKeyApproved on Machine verified");
+    } else {
+        test_ctx.info("Skipping AttestationKey events (publicAttestationKeyRegisterAddr not set)");
+    }
+
+    test_ctx.info(format!("Deleting Machine {machine_name} to trigger KeyRevoked"));
+    machines.delete(machine_name, &Default::default()).await?;
+    wait_for_resource_deleted(&machines, machine_name, scaled_timeout(120)).await?;
+
+    wait_for_event(client, namespace, machine_name, "KeyRevoked", scaled_timeout(60)).await?;
+    test_ctx.info("Event KeyRevoked verified");
+
+    test_ctx.info("All expected Kubernetes events verified");
     att_ctx.cleanup().await?;
     test_ctx.cleanup().await?;
     Ok(())
