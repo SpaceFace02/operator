@@ -21,7 +21,8 @@ path = [
   "examples/*",
   "tools/virtctl/go.sum",
   "tools/operator-sdk/go.sum",
-  "scripts/install-kubevirt.sh"
+  "scripts/install-kubevirt.sh",
+  ".devcontainer/*",
 ]
 SPDX-FileCopyrightText = [
     "Alice Frosi <afrosi@redhat.com>",
