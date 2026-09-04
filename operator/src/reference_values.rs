@@ -7,21 +7,17 @@ use anyhow::{Context, Result, anyhow};
 use compute_pcrs_lib::Pcr;
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::ObjectReference;
-use k8s_openapi::{
-    api::{
-        batch::v1::{Job, JobSpec},
-        core::v1::{ConfigMap, Container, ImageVolumeSource, Volume, VolumeMount},
-        core::v1::{Pod, PodSpec, PodTemplateSpec},
-    },
-    jiff::Timestamp,
+use k8s_openapi::api::{
+    batch::v1::{Job, JobSpec},
+    core::v1::{Container, ImageVolumeSource, Volume, VolumeMount},
+    core::v1::{Pod, PodSpec, PodTemplateSpec},
 };
-use kube::api::{DeleteParams, ListParams, ObjectMeta, Patch, PatchParams};
+use kube::api::{DeleteParams, ListParams, ObjectMeta, Patch};
 use kube::runtime::{
     controller::{Action, Controller},
     events::EventType,
     finalizer,
     finalizer::Event,
-    reflector::ObjectRef,
     watcher,
 };
 use kube::{Api, Client, Resource};
@@ -119,7 +115,7 @@ async fn job_reconcile(
     let delete = jobs.delete(name, &DeleteParams::foreground()).await;
     delete.map_err(Into::<anyhow::Error>::into)?;
     trustee::update_reference_values(&ctx).await?;
-    
+
     if let Some(owner) = job
         .metadata
         .owner_references
@@ -323,25 +319,23 @@ async fn image_add_reconcile(
     }
     let image_ref: ObjectReference = image.object_ref(&());
     let (action, reason) = match handle_new_image(ctx, image).await {
-        Ok(NOT_COMMITTED_REASON_COMPUTING) => (
-            Action::requeue(PCR_COMPUTING_REQUEUE),
-            NOT_COMMITTED_REASON_COMPUTING,
-        ),
-        Ok(reason) => {
-            if reason == NOT_COMMITTED_REASON_COMPUTING {
-                record_event(
-                    &ctx.recorder,
-                    &image_ref,
-                    EventType::Normal,
-                    "ComputationStarted",
-                    format!("PCR computation started for {name}"),
-                    "Computing",
-                    None,
-                )
-                .await;
-            }
-            (LONG_REQUEUE, reason)
+        Ok(NOT_COMMITTED_REASON_COMPUTING) => {
+            record_event(
+                &ctx.recorder,
+                &image_ref,
+                EventType::Normal,
+                "ComputationStarted",
+                format!("PCR computation started for {name}"),
+                "Computing",
+                None,
+            )
+            .await;
+            (
+                Action::requeue(PCR_COMPUTING_REQUEUE),
+                NOT_COMMITTED_REASON_COMPUTING,
+            )
         }
+        Ok(reason) => (LONG_REQUEUE, reason),
         Err(e) => {
             warn!("PCR computation for {name} failed: {e}");
             record_event(
@@ -518,7 +512,6 @@ mod tests {
     use crate::test_utils::*;
     use http::{Method, Request, StatusCode};
     use k8s_openapi::api::batch::v1::JobStatus;
-    use k8s_openapi::api::core::v1::ConfigMap;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use k8s_openapi::jiff::Timestamp;
     use kube::api::ObjectList;
@@ -719,11 +712,7 @@ mod tests {
             let mut ctx = OperatorContext::new(client);
             ctx.secret_store = store_with(vec![auth]);
             ctx.tec_store = store_with(vec![dummy_cluster()]);
-            assert!(
-                image_remove_reconcile(&ctx, image, cluster)
-                    .await
-                    .is_err()
-            );
+            assert!(image_remove_reconcile(&ctx, image, cluster).await.is_err());
         });
     }
 }
