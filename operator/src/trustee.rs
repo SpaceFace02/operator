@@ -8,10 +8,10 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use clevis_pin_trustee_lib::Key as ClevisKey;
-use compute_pcrs_lib::tpmevents::TPMEvent;
-use compute_pcrs_lib::tpmevents::combine::combine_images;
 use futures_util::StreamExt;
-use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+use k8s_openapi::api::apps::v1::{
+    Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment,
+};
 use k8s_openapi::api::core::v1::{
     ConfigMap, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, EnvVar,
     KeyToPath, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource, Service, ServicePort,
@@ -45,8 +45,6 @@ const TRUSTEE_DATA_DIR: &str = "/etc/kbs";
 const KBS_CONFIG_FILE: &str = "kbs-config.toml";
 
 pub(crate) const TRUSTEE_DATA_MAP: &str = "trustee-data";
-pub(crate) const TRUSTEE_RV_MAP: &str = "trustee-rv-data";
-pub(crate) const REFERENCE_VALUES_FILE: &str = "reference-values.json";
 const TRUSTEE_AUTH_SECRET: &str = "trustee-auth";
 const TRUSTEE_AUTH_KEY_DIR: &str = "/opt/trustee/keys";
 const TRUSTEE_STORAGE_VOLUME: &str = "trustee-storage";
@@ -80,7 +78,7 @@ struct ReferenceValue {
 /// on image disallow, we need to force update the reference values with the empty array.
 const ATTESTED_PCR_IDS: [i64; 2] = [4, 14];
 
-fn recompute_reference_values(image_pcrs: ImagePcrs) -> Vec<ReferenceValue> {
+fn recompute_reference_values(all_pcrs: &[Vec<ApprovedImageStatusPcrs>]) -> Vec<ReferenceValue> {
     let mut reference_values_in =
         BTreeMap::from([("svn".to_string(), BTreeSet::from(["1".to_string()]))]);
     // Safe default in case pcr computation fails.
@@ -92,7 +90,6 @@ fn recompute_reference_values(image_pcrs: ImagePcrs) -> Vec<ReferenceValue> {
         .iter()
         .map(|image_pcrs| status_to_tpm_events(image_pcrs))
         .collect();
-
     let pcr_combinations = combine_images(&tpm_events);
     for pcr in pcr_combinations.iter().flatten() {
         reference_values_in
@@ -111,30 +108,35 @@ fn recompute_reference_values(image_pcrs: ImagePcrs) -> Vec<ReferenceValue> {
         .collect()
 }
 
-pub async fn update_reference_values(ctx: &OperatorContext, image_pcrs: ImagePcrs) -> Result<()> {
-    let reference_values = recompute_reference_values(image_pcrs);
-    let rv_json = serde_json::to_string(&reference_values)?;
+pub async fn update_reference_values(ctx: &OperatorContext) -> Result<()> {
+    let images: Api<ApprovedImage> = Api::default_namespaced(ctx.client.clone());
+    let image_list = images.list(&Default::default()).await?;
 
-    let config_maps: Api<ConfigMap> = Api::default_namespaced(ctx.client.clone());
-    let cm_data = BTreeMap::from([(REFERENCE_VALUES_FILE.to_string(), rv_json)]);
-    let cm = ConfigMap {
-        metadata: ObjectMeta {
-            name: Some(TRUSTEE_RV_MAP.to_string()),
-            ..Default::default()
-        },
-        data: Some(cm_data),
-        ..Default::default()
-    };
-    let patch = Patch::Apply(serde_json::to_value(cm)?);
-    let pp = PatchParams::apply("trusted-cluster-operator").force();
-    config_maps.patch(TRUSTEE_RV_MAP, &pp, &patch).await?;
+    let all_pcrs: Vec<Vec<ApprovedImageStatusPcrs>> = image_list
+        .items
+        .iter()
+        .filter(|img| img.metadata.deletion_timestamp.is_none())
+        .filter(|img| {
+            img.status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|cs| {
+                    cs.iter()
+                        .any(|c| c.type_ == COMMITTED_CONDITION && c.status == "True")
+                })
+        })
+        .filter_map(|img| img.status.as_ref().and_then(|s| s.pcrs.clone()))
+        .collect();
 
-    if let Err(e) = sync_reference_values(ctx, &reference_values).await {
-        warn!(
-            "Failed to sync reference values to KBS (will retry on next deployment reconcile): {e}"
-        );
-    }
-    info!("Recomputed reference values");
+    let reference_values = recompute_reference_values(&all_pcrs);
+
+    sync_reference_values(ctx, &reference_values)
+        .await
+        .context("Failed to sync reference values to KBS")?;
+    info!(
+        "Recomputed reference values from {} committed images",
+        all_pcrs.len()
+    );
     Ok(())
 }
 
@@ -245,7 +247,8 @@ pub async fn sync_attestation_policy(ctx: &OperatorContext) -> Result<()> {
     Ok(())
 }
 
-async fn trustee_deployment_reconcile(
+// Called directly in main.rs reconcile loop. Needs to have proper visibility between modules, but in the same crate.
+pub(crate) async fn trustee_deployment_reconcile(
     deployment: Arc<Deployment>,
     ctx: Arc<OperatorContext>,
 ) -> Result<Action, ControllerError> {
@@ -263,7 +266,7 @@ async fn trustee_deployment_reconcile(
             warn!("Failed to sync attestation policy to KBS: {e}");
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
-        if let Err(e) = sync_reference_values_from_configmap(&ctx).await {
+        if let Err(e) = update_reference_values(&ctx).await {
             warn!("Failed to sync reference values to KBS: {e}");
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
@@ -520,22 +523,21 @@ pub async fn generate_trustee_data(
         data: Some(data),
         ..Default::default()
     };
-    create_or_info_if_exists!(client, ConfigMap, config_map);
-    Ok(())
-}
 
-pub async fn generate_rv_data(client: Client, owner_reference: OwnerReference) -> Result<()> {
-    let data = BTreeMap::from([(REFERENCE_VALUES_FILE.to_string(), "[]".to_string())]);
-    let config_map = ConfigMap {
-        metadata: ObjectMeta {
-            name: Some(TRUSTEE_RV_MAP.to_string()),
-            owner_references: Some(vec![owner_reference]),
-            ..Default::default()
-        },
-        data: Some(data),
-        ..Default::default()
-    };
-    create_or_info_if_exists!(client, ConfigMap, config_map);
+    // reuse the configmap during upgrade to avoid downtime.
+    let cms: Api<ConfigMap> = Api::default_namespaced(client);
+    if cms.get_opt(TRUSTEE_DATA_MAP).await?.is_some() {
+        cms.patch(
+            TRUSTEE_DATA_MAP,
+            &PatchParams::default(),
+            &Patch::Strategic(config_map),
+        )
+        .await?;
+        info!("Patched trustee-data ConfigMap");
+    } else {
+        cms.create(&Default::default(), &config_map).await?;
+        info!("Created trustee-data ConfigMap");
+    }
     Ok(())
 }
 
@@ -659,21 +661,20 @@ fn generate_kbs_pod_spec(image: &str, tls_volumes: Option<(Volume, VolumeMount)>
     }
 }
 
-pub async fn generate_kbs_deployment(
+async fn build_kbs_deployment(
     client: Client,
     owner_reference: OwnerReference,
     image: &str,
     secret: &Option<String>,
-) -> Result<()> {
+) -> Result<Deployment> {
     let selector = Some(BTreeMap::from([(
         "app".to_string(),
         TRUSTEE_APP_LABEL.to_string(),
     )]));
-    let tls_volumes = read_certificate(client.clone(), secret).await?;
+    let tls_volumes = read_certificate(client, secret).await?;
     let pod_spec = generate_kbs_pod_spec(image, tls_volumes);
 
-    // Inspired by trustee-operator
-    let deployment = Deployment {
+    Ok(Deployment {
         metadata: ObjectMeta {
             name: Some(TRUSTEE_DEPLOYMENT.to_string()),
             labels: selector.clone(),
@@ -682,6 +683,14 @@ pub async fn generate_kbs_deployment(
         },
         spec: Some(DeploymentSpec {
             replicas: Some(1),
+            // Adding a rolling update strategy to prevent downtime during upgrade. If new trustee pod fails to come up, oldOne will still continue serving to ensure no downtime.
+            strategy: Some(DeploymentStrategy {
+                type_: Some("RollingUpdate".to_string()),
+                rolling_update: Some(RollingUpdateDeployment {
+                    max_unavailable: Some(IntOrString::Int(0)),
+                    max_surge: Some(IntOrString::Int(1)),
+                }),
+            }),
             selector: LabelSelector {
                 match_labels: selector.clone(),
                 ..Default::default()
@@ -696,8 +705,39 @@ pub async fn generate_kbs_deployment(
             ..Default::default()
         }),
         ..Default::default()
-    };
+    })
+}
+
+// Called during initial install.
+pub async fn generate_kbs_deployment(
+    client: Client,
+    owner_reference: OwnerReference,
+    image: &str,
+    secret: &Option<String>,
+) -> Result<()> {
+    let deployment = build_kbs_deployment(client.clone(), owner_reference, image, secret).await?;
     create_or_info_if_exists!(client, Deployment, deployment);
+    Ok(())
+}
+
+// Called during upgrade.
+// Patches the deployment in place.
+pub async fn apply_kbs_deployment(
+    client: Client,
+    owner_reference: OwnerReference,
+    image: &str,
+    secret: &Option<String>,
+) -> Result<()> {
+    let deployment = build_kbs_deployment(client.clone(), owner_reference, image, secret).await?;
+    let deployments: Api<Deployment> = Api::default_namespaced(client);
+    deployments
+        .patch(
+            TRUSTEE_DEPLOYMENT,
+            &PatchParams::default(),
+            &Patch::Strategic(deployment),
+        )
+        .await?;
+    info!("Applied full Trustee Deployment spec for {image}");
     Ok(())
 }
 
@@ -712,7 +752,6 @@ mod tests {
     use trusted_cluster_operator_lib::conditions::COMMITTED_CONDITION;
     use trusted_cluster_operator_test_utils::mock_client::*;
     use trusted_cluster_operator_test_utils::test_error_method;
-    use trusted_cluster_operator_test_utils::*;
 
     fn reference_values_from(reference_values: &[ReferenceValue], rv_name: &str) -> Vec<String> {
         let rv = reference_values
@@ -967,19 +1006,40 @@ mod tests {
     #[tokio::test]
     async fn test_generate_trustee_data_success() {
         let clos = |client| generate_trustee_data(client, Default::default(), &None);
-        test_create_success::<_, _, ConfigMap>(clos).await;
+        let server = async |req: Request<_>, ctr| match (ctr, req.method()) {
+            (0, &Method::GET) => Err(StatusCode::NOT_FOUND),
+            (1, &Method::POST) => Ok(serde_json::to_string(&ConfigMap::default()).unwrap()),
+            _ => panic!("unexpected API interaction: {req:?}, counter {ctr}"),
+        };
+        count_check!(2, server, |client| {
+            assert!(clos(client).await.is_ok());
+        });
     }
 
     #[tokio::test]
     async fn test_generate_trustee_data_already_exists() {
         let clos = |client| generate_trustee_data(client, Default::default(), &None);
-        test_create_already_exists(clos).await;
+        let server = async |req: Request<_>, ctr| match (ctr, req.method()) {
+            (0, &Method::GET) => Ok(serde_json::to_string(&ConfigMap::default()).unwrap()),
+            (1, &Method::PATCH) => Ok(serde_json::to_string(&ConfigMap::default()).unwrap()),
+            _ => panic!("unexpected API interaction: {req:?}, counter {ctr}"),
+        };
+        count_check!(2, server, |client| {
+            assert!(clos(client).await.is_ok());
+        });
     }
 
     #[tokio::test]
     async fn test_generate_trustee_data_error() {
         let clos = |client| generate_trustee_data(client, Default::default(), &None);
-        test_error_method!(clos, Method::POST);
+        let server = async |req: Request<_>, ctr| match (ctr, req.method()) {
+            (0, &Method::GET) => Ok(serde_json::to_string(&ConfigMap::default()).unwrap()),
+            (1, &Method::PATCH) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+            _ => panic!("unexpected API interaction: {req:?}, counter {ctr}"),
+        };
+        count_check!(2, server, |client| {
+            assert!(clos(client).await.is_err());
+        });
     }
 
     #[tokio::test]
