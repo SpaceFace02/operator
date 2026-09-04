@@ -4901,6 +4901,7 @@ dependencies = [
  "k8s-openapi 0.28.0",
  "kopium",
  "kube 4.2.0",
+ "log",
  "serde",
  "serde_json",
  "strum 0.28.0",
