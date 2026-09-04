@@ -1,0 +1,6 @@
+{
+    "rust-analyzer.cargo.features": [
+        "virtualization"
+    ],
+    "claudeCode.useTerminal": true
+}

@@ -250,6 +250,7 @@ async fn approve_ak(ak: &AttestationKey, machine: &Machine, ctx: &OperatorContex
     let obj_ref = ObjectRef::new(&secret_name).within(client.default_namespace());
     let secret_exists = ctx.secret_store.get(&obj_ref).is_some();
 
+    let secrets: Api<Secret> = Api::default_namespaced(client.clone());
     if !secret_exists {
         let public_key_data = ByteString(ak.spec.public_key.as_bytes().to_vec());
         let data = BTreeMap::from([("public_key".to_string(), public_key_data)]);
@@ -273,6 +274,9 @@ async fn approve_ak(ak: &AttestationKey, machine: &Machine, ctx: &OperatorContex
 
         create_or_info_if_exists!(client.clone(), Secret, secret);
         info!("Created secret {secret_name} for attestation key {name} with finalizer");
+    } else {
+        // Ensures the AttestationKey secret has the label the secret controller watches on.
+        ensure_secret_label(&secrets, &secret_name).await?;
     }
 
     let machine_condition =
@@ -289,6 +293,33 @@ async fn approve_ak(ak: &AttestationKey, machine: &Machine, ctx: &OperatorContex
         info!("Set AttestationKeyApproved condition on Machine {machine_name}");
     }
 
+    Ok(())
+}
+
+// Secrets created by older operator versions lack the label, as older operator versions watched all secrets, without label filters.
+async fn ensure_secret_label(secrets: &Api<Secret>, name: &str) -> Result<()> {
+    let Some(secret) = secrets.get_opt(name).await? else {
+        return Ok(());
+    };
+    let has_label = secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(KIND_LABEL_KEY))
+        .is_some_and(|v| v == ATTESTATION_KEY_LABEL_VALUE);
+    if !has_label {
+        let patch = json!({
+            "metadata": {
+                "labels": {
+                    KIND_LABEL_KEY: ATTESTATION_KEY_LABEL_VALUE
+                }
+            }
+        });
+        secrets
+            .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        info!("Patched missing {KIND_LABEL_KEY} label onto secret {name}");
+    }
     Ok(())
 }
 
@@ -315,8 +346,24 @@ async fn secret_reconcile(
             }
             Event::Cleanup(secret) => {
                 let secret_name = secret.metadata.name.clone().unwrap_or_default();
+
+                // If TEC is already being deleted, trustee will be deleted too, so no need to update it.
+                let tec_deleting = ctx
+                    .get_opt_tec()
+                    .ok()
+                    .flatten()
+                    .is_none_or(|tec| tec.metadata.deletion_timestamp.is_some());
+
+                if tec_deleting {
+                    info!(
+                        "TrustedExecutionCluster is being deleted, \
+                         skipping trustee update for AttestationKey secret {secret_name}"
+                    );
+                    return Ok(LONG_REQUEUE);
+                }
+
                 info!(
-                    "AttestationKey secret {secret_name} is being deleted, updating trustee deployment volumes"
+                    "AttestationKey secret {secret_name} is being deleted, updating trustee"
                 );
                 // Update trustee deployment - secrets with deletion_timestamp will be filtered out
                 trustee::update_attestation_keys(&ctx)
