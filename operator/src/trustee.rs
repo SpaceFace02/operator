@@ -936,7 +936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_rvs_success() {
+    async fn test_update_rvs_failed() {
         let _ = jsonwebtoken_openssl::install_default();
         let clos = async |req: Request<_>, ctr| match (ctr, req.method()) {
             (0, &Method::GET) => {
