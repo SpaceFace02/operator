@@ -74,7 +74,7 @@ struct ReferenceValue {
 /// This is required to update reference values once a image is disallowed.
 /// reference values can only be updated, not deleted.
 /// on image disallow, we need to force update the reference values with the empty array.
-const ATTESTED_PCR_IDS: [i64; 2] = [4, 14];
+const ATTESTED_PCR_IDS: [i64; 3] = [4, 7, 14];
 
 fn recompute_reference_values(all_pcrs: &[Vec<ApprovedImageStatusPcrs>]) -> Vec<ReferenceValue> {
     let mut reference_values_in =
@@ -86,7 +86,7 @@ fn recompute_reference_values(all_pcrs: &[Vec<ApprovedImageStatusPcrs>]) -> Vec<
 
     let tpm_events: Vec<Vec<_>> = all_pcrs
         .iter()
-        .map(status_to_tpm_events)
+        .map(|image_pcrs| status_to_tpm_events(image_pcrs))
         .collect();
     let pcr_combinations = combine_images(&tpm_events);
     for pcr in pcr_combinations.iter().flatten() {
@@ -709,6 +709,141 @@ mod tests {
         val_arr.iter().map(|v| v.as_str().unwrap().into()).collect()
     }
 
+    // Mock committed approved image.
+    fn committed_approved_image(name: &str, pcrs: Vec<ApprovedImageStatusPcrs>) -> ApprovedImage {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+        ApprovedImage {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            spec: trusted_cluster_operator_lib::ApprovedImageSpec {
+                image: format!("quay.io/{name}@sha256:abc123"),
+            },
+            status: Some(trusted_cluster_operator_lib::ApprovedImageStatus {
+                conditions: Some(vec![Condition {
+                    type_: COMMITTED_CONDITION.to_string(),
+                    status: "True".to_string(),
+                    reason: "ImageCommitted".to_string(),
+                    message: String::new(),
+                    last_transition_time: Time(Timestamp::now()),
+                    observed_generation: None,
+                }]),
+                pcrs: Some(pcrs),
+                first_seen: None,
+            }),
+        }
+    }
+
+    // Makes sure the reference values are computed correctly for the dummy PCRs.
+    #[test]
+    fn test_recompute_reference_values() {
+        let pcrs = vec![dummy_status_pcrs()]; // includes PCR4 ,PCR7 and PCR14 values
+        let result = recompute_reference_values(&pcrs);
+        let vals = reference_values_from(&result, "tpm_pcr4");
+        assert_eq!(vals, vec![dummy_pcr_value(4)]);
+        let vals = reference_values_from(&result, "tpm_pcr7");
+        assert_eq!(vals, vec![dummy_pcr_value(7)]);
+        let vals = reference_values_from(&result, "tpm_pcr14");
+        assert_eq!(vals, vec![dummy_pcr_value(14)]);
+    }
+
+    // Makes sure the reference values are computed correctly for an empty PCRs, it should have a single value for the SVN, and empty values for the PCR4 and 14.
+    #[test]
+    fn test_recompute_reference_values_empty() {
+        let result = recompute_reference_values(&[]);
+        let vals = reference_values_from(&result, "tpm_svn");
+        assert_eq!(vals, vec!["1"]);
+        assert!(reference_values_from(&result, "tpm_pcr4").is_empty());
+        assert!(reference_values_from(&result, "tpm_pcr7").is_empty());
+        assert!(reference_values_from(&result, "tpm_pcr14").is_empty());
+    }
+
+    // Tests combination PCR values.
+    #[test]
+    fn test_recompute_reference_values_multiple_images() {
+        use compute_pcrs_lib::Pcr;
+        use trusted_cluster_operator_lib::reference_values::pcrs_to_status;
+
+        // Dummy PCR values for the first image, directly from the dummy_status_pcrs() function.
+        let pcrs1 = dummy_status_pcrs();
+
+        // Dummy PCR values for another approved image.
+        let other_shim = dummy_static_events::shim_11();
+        let other_grub = dummy_static_events::grub_22();
+        let other_vmlinuz = dummy_static_events::vmlinuz_33();
+        let other_secureboot = dummy_static_events::secure_boot_44();
+        let other_mok = dummy_static_events::mok_55();
+
+        // Extend and compute PCR4 and 14 values for the other image.
+        let other_pcr4 = Pcr::compile_from(&vec![other_shim, other_grub, other_vmlinuz]);
+        let other_pcr7 = Pcr::compile_from(&vec![other_secureboot]);
+        let other_pcr14 = Pcr::compile_from(&vec![other_mok]);
+
+        // Encode the PCR values for the other image.
+        let pcr4_other_value = hex::encode(&other_pcr4.value);
+        let pcr7_other_value = hex::encode(&other_pcr7.value);
+        let pcr14_other_value = hex::encode(&other_pcr14.value);
+
+        let pcrs2 = pcrs_to_status(&[other_pcr4, other_pcr7, other_pcr14]);
+
+        let result = recompute_reference_values(&[pcrs1, pcrs2]);
+
+        // combine_images produces combinations respecting event groups:
+        //   shim, grub  -> TPMEG_BOOTLOADER (must come from same image)
+        //   vmlinuz     -> TPMEG_LINUX      (independent, can mix)
+        // So for PCR4 we expect 4 valid states:
+        //   1. img1 bootloader + img1 kernel  (pure image 1)
+        //   2. img2 bootloader + img2 kernel  (pure image 2)
+        //   3. img1 bootloader(includes shim and grub) + img2 kernel  (cross: rolling upgrade mid-state)
+        //   4. img2 bootloader(includes shim and grub) + img1 kernel  (cross: rolling upgrade mid-state)
+        let vals_pcr4 = reference_values_from(&result, "tpm_pcr4");
+        assert_eq!(
+            vals_pcr4.len(),
+            4,
+            "Expected 4 PCR4 combinations, got: {vals_pcr4:?}"
+        );
+
+        // Assert pure image PCR4 values
+        assert!(vals_pcr4.contains(&dummy_pcr_value(4)));
+        assert!(vals_pcr4.contains(&pcr4_other_value));
+
+        // Assert combination PCR4 values
+        // Cross-combination: image 1 bootloader (shim=0xaa, grub=0xbb) + image 2 kernel (vmlinuz=0x33)
+        let cross_a = Pcr::compile_from(&vec![
+            dummy_static_events::shim_aa(),
+            dummy_static_events::grub_bb(),
+            dummy_static_events::vmlinuz_cc(),
+        ]);
+        assert!(
+            vals_pcr4.contains(&hex::encode(&cross_a.value)),
+            "Missing cross-combination: img1 bootloader + img2 kernel"
+        );
+
+        // Cross-combination: image 2 bootloader (shim=0x11, grub=0x22) + image 1 kernel (vmlinuz=0xcc)
+        let cross_b = Pcr::compile_from(&vec![
+            dummy_static_events::shim_11(),
+            dummy_static_events::grub_22(),
+            dummy_static_events::vmlinuz_cc(),
+        ]);
+        assert!(
+            vals_pcr4.contains(&hex::encode(&cross_b.value)),
+            "Missing cross-combination: img2 bootloader + img1 kernel"
+        );
+
+        // PCR 7 combination: should have 1 combination values + 2 individual values
+        // combination: image 1 bootloader (shimcert = 0xee, shim = 0xaa, grub = 0xbb) + image 2 secureboot (secureboot=0x44)
+        let vals_pcr7 = reference_values_from(&result, "tpm_pcr7");
+        assert_eq!(vals_pcr7.len(), 3);
+        assert!(vals_pcr7.contains(&dummy_pcr_value(7)));
+        assert!(vals_pcr7.contains(&pcr7_other_value));
+
+        // PCR14: mokList is in TPMEG_MOKVARS (independent group), so 2 values (one per image)
+        let vals_pcr14 = reference_values_from(&result, "tpm_pcr14");
+        assert_eq!(vals_pcr14.len(), 2);
+        assert!(vals_pcr14.contains(&dummy_pcr_value(14)));
+        assert!(vals_pcr14.contains(&pcr14_other_value));
+    }
 
     #[tokio::test]
     async fn test_update_rvs_success() {

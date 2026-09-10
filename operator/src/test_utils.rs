@@ -4,7 +4,6 @@
 
 use crate::trustee;
 use compute_pcrs_lib::Pcr;
-use compute_pcrs_lib::tpmevents::{TPMEvent, TPMEventID};
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::ObjectMeta;
@@ -31,37 +30,120 @@ where
     store
 }
 
-pub fn dummy_pcrs() -> Vec<Pcr> {
+pub mod dummy_static_events {
+    use compute_pcrs_lib::tpmevents::{TPMEvent, TPMEventID};
+
     // Ideally the name should be something like EV_EFI_BOOT_SERVICES_APPLICATION for shium, grub and even vmlinuz, but for readability and simplicity, we use the name of the file.
     // event id anyways uniquely identifies the event, so we are free to choose our own names.
-    let event_shim = TPMEvent {
-        name: "shim".to_string(),
-        pcr: 4,
-        hash: vec![0xaa; 32],
-        id: TPMEventID::Pcr4Shim,
-    };
-    let event_grub = TPMEvent {
-        name: "grub".to_string(),
-        pcr: 4,
-        hash: vec![0xbb; 32],
-        id: TPMEventID::Pcr4Grub,
-    };
-    let event_vmlinuz = TPMEvent {
-        name: "vmlinuz".to_string(),
-        pcr: 4,
-        hash: vec![0xcc; 32],
-        id: TPMEventID::Pcr4Vmlinuz,
-    };
-    let event_mok = TPMEvent {
-        name: "mokList".to_string(),
-        pcr: 14,
-        hash: vec![0xdd; 32],
-        id: TPMEventID::Pcr14MokList,
-    };
+
+    // events for pcr 4
+    pub fn shim_aa() -> TPMEvent {
+        TPMEvent {
+            name: "shim".to_string(),
+            pcr: 4,
+            hash: vec![0xaa; 32],
+            id: TPMEventID::Pcr4Shim,
+        }
+    }
+    pub fn shim_11() -> TPMEvent {
+        TPMEvent {
+            name: "shim".to_string(),
+            pcr: 4,
+            hash: vec![0x11; 32],
+            id: TPMEventID::Pcr4Shim,
+        }
+    }
+    pub fn grub_22() -> TPMEvent {
+        TPMEvent {
+            name: "grub".to_string(),
+            pcr: 4,
+            hash: vec![0x22; 32],
+            id: TPMEventID::Pcr4Grub,
+        }
+    }
+    pub fn grub_bb() -> TPMEvent {
+        TPMEvent {
+            name: "grub".to_string(),
+            pcr: 4,
+            hash: vec![0xbb; 32],
+            id: TPMEventID::Pcr4Grub,
+        }
+    }
+    pub fn vmlinuz_cc() -> TPMEvent {
+        TPMEvent {
+            name: "vmlinuz".to_string(),
+            pcr: 4,
+            hash: vec![0xcc; 32],
+            id: TPMEventID::Pcr4Vmlinuz,
+        }
+    }
+    pub fn vmlinuz_33() -> TPMEvent {
+        TPMEvent {
+            name: "vmlinuz".to_string(),
+            pcr: 4,
+            hash: vec![0x33; 32],
+            id: TPMEventID::Pcr4Vmlinuz,
+        }
+    }
+
+    // events for pcr 7
+    pub fn secure_boot_dd() -> TPMEvent {
+        TPMEvent {
+            name: "secure_boot".to_string(),
+            pcr: 7,
+            hash: vec![0xdd; 32],
+            id: TPMEventID::Pcr7SecureBoot,
+        }
+    }
+    pub fn shimcert_ee() -> TPMEvent {
+        TPMEvent {
+            name: "shimcert".to_string(),
+            pcr: 7,
+            hash: vec![0xee; 32],
+            id: TPMEventID::Pcr7ShimCert,
+        }
+    }
+    pub fn secure_boot_44() -> TPMEvent {
+        TPMEvent {
+            name: "secure_boot".to_string(),
+            pcr: 7,
+            hash: vec![0x44; 32],
+            id: TPMEventID::Pcr7SecureBoot,
+        }
+    }
+
+    // events for pcr 14
+    pub fn mok_ff() -> TPMEvent {
+        TPMEvent {
+            name: "mokList".to_string(),
+            pcr: 14,
+            hash: vec![0xff; 32],
+            id: TPMEventID::Pcr14MokList,
+        }
+    }
+    pub fn mok_55() -> TPMEvent {
+        TPMEvent {
+            name: "mokList".to_string(),
+            pcr: 14,
+            hash: vec![0x55; 32],
+            id: TPMEventID::Pcr14MokList,
+        }
+    }
+}
+
+pub fn dummy_pcrs() -> Vec<Pcr> {
     vec![
         // Build the PCR values from the events instead of harcoding constants. Events are the source of truth.
-        Pcr::compile_from(&vec![event_shim, event_grub, event_vmlinuz]),
-        Pcr::compile_from(&vec![event_mok]),
+        Pcr::compile_from(&vec![
+            dummy_static_events::shim_aa(),
+            dummy_static_events::grub_bb(),
+            dummy_static_events::vmlinuz_cc(),
+        ]),
+        Pcr::compile_from(&vec![
+            dummy_static_events::secure_boot_dd(),
+            dummy_static_events::shimcert_ee(),
+        ]),
+        Pcr::compile_from(&vec![dummy_static_events::mok_ff()]),
     ]
 }
 

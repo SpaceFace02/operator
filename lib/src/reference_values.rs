@@ -30,7 +30,7 @@ pub fn pcrs_to_status(pcrs: &[Pcr]) -> Vec<ApprovedImageStatusPcrs> {
 }
 
 // Convert ApprovedImageStatusPcrs to TPMEvents
-pub fn status_to_tpm_events(pcrs: &Vec<ApprovedImageStatusPcrs>) -> Vec<TPMEvent> {
+pub fn status_to_tpm_events(pcrs: &[ApprovedImageStatusPcrs]) -> Vec<TPMEvent> {
     pcrs.iter()
         .flat_map(|p| {
             p.events.as_ref().map_or_else(Vec::new, |events| {
