@@ -9,23 +9,21 @@ use chrono::Utc;
 use compute_pcrs_lib::Pcr;
 use compute_pcrs_lib::tpmevents::{TPMEvent, TPMEventID};
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, OwnerReference};
+use k8s_openapi::api::core::v1::{Pod, Secret};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, ObjectMeta, OwnerReference};
 use kube::api::{ListParams, LogParams, Patch, PatchParams};
 use kube::runtime::wait::await_condition;
 use kube::{Api, api::DeleteParams};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::timeout;
-use trusted_cluster_operator_lib::conditions::NOT_COMMITTED_REASON_PENDING;
+use trusted_cluster_operator_lib::conditions::{COMMITTED_CONDITION, NOT_COMMITTED_REASON_PENDING};
 use trusted_cluster_operator_lib::endpoints::{REGISTER_SERVER_DEPLOYMENT, TRUSTEE_DEPLOYMENT};
 use trusted_cluster_operator_lib::{
     ApprovedImage, AttestationKey, Machine, TrustedExecutionCluster, generate_owner_reference,
 };
 use trusted_cluster_operator_test_utils::constants::*;
 use trusted_cluster_operator_test_utils::*;
-const TRUSTEE_RV_MAP: &str = "trustee-rv-data";
 
 fn ak_approved(ak: Option<&AttestationKey>) -> bool {
     let is_approved = |c: &Condition| c.type_ == "Approved" && c.status == "True";
@@ -126,7 +124,7 @@ named_test!(
 );
 
 named_test! {
-async fn test_image_pcrs_configmap_updates() -> anyhow::Result<()> {
+async fn test_image_pcrs_updates() -> anyhow::Result<()> {
     let test_ctx = setup!().await?;
 
     test_ctx.verify_expected_pcrs(&[&primary_pcrs!()]).await?;
@@ -145,15 +143,7 @@ async fn test_image_disallow() -> anyhow::Result<()> {
     let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
     images.delete(APPROVED_IMAGE_NAME, &DeleteParams::default()).await?;
 
-    let configmap_api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-    let chk_removed = |cm: Option<&ConfigMap>| {
-        let data = cm.and_then(|cm| cm.data.as_ref());
-        let json = data.and_then(|data| data.get(RV_JSON_KEY));
-        json.map(|json| !json.contains(PRIMARY_PCR4_HASH)).unwrap_or(false)
-    };
-    let rv_removed = await_condition(configmap_api, TRUSTEE_RV_MAP, chk_removed);
-    let ctx = format!("waiting for ConfigMap {TRUSTEE_RV_MAP} to not contain PCR value");
-    timeout(scaled_duration(180), rv_removed).await.context(ctx)??;
+    wait_for_resource_deleted(&images, APPROVED_IMAGE_NAME, scaled_timeout(180)).await?;
 
     test_ctx.cleanup().await?;
     Ok(())
@@ -688,7 +678,6 @@ async fn test_approved_image_readoption() -> anyhow::Result<()> {
 
     let clusters: Api<TrustedExecutionCluster> = Api::namespaced(client.clone(), namespace);
     let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
-    let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
 
     let cluster_spec = clusters.get(TEC_NAME).await?.spec;
     let image_spec = images.get(APPROVED_IMAGE_NAME).await?.spec;
@@ -703,9 +692,8 @@ async fn test_approved_image_readoption() -> anyhow::Result<()> {
 
     test_ctx.info(format!("Deleting TrustedExecutionCluster {TEC_NAME}"));
     clusters.delete(TEC_NAME, &Default::default()).await?;
-    wait_for_resource_deleted(&configmaps, TRUSTEE_RV_MAP, scaled_timeout(60)).await?;
     wait_for_resource_deleted(&images, APPROVED_IMAGE_NAME, scaled_timeout(60)).await?;
-    test_ctx.info(format!("Configmap {TRUSTEE_RV_MAP} was removed"));
+    test_ctx.info("ApprovedImage was removed after TrustedExecutionCluster deletion");
 
     let image = ApprovedImage {
         spec: image_spec,
@@ -729,15 +717,18 @@ async fn test_approved_image_readoption() -> anyhow::Result<()> {
     // Ensure adoption works even when cluster creation was delayed
     tokio::time::sleep(Duration::from_secs(5)).await;
     clusters.create(&Default::default(), &cluster).await?;
-    let chk_added = |cm: Option<&ConfigMap>| {
-        let data = cm.and_then(|cm| cm.data.as_ref());
-        let json = data.and_then(|data| data.get(RV_JSON_KEY));
-        json.map(|json| json.contains(PRIMARY_PCR4_HASH)).unwrap_or(false)
+    let committed = |img: Option<&ApprovedImage>| {
+        img.and_then(|i| i.status.as_ref())
+            .and_then(|s| s.conditions.as_ref())
+            .is_some_and(|cs| {
+                cs.iter()
+                    .any(|c| c.type_ == COMMITTED_CONDITION && c.status == "True")
+            })
     };
-    let rv_added = await_condition(configmaps, TRUSTEE_RV_MAP, chk_added);
-    let ctx = format!("waiting for ConfigMap {TRUSTEE_RV_MAP} to contain PCR value");
-    timeout(scaled_duration(180), rv_added).await.context(ctx)??;
-    test_ctx.info("Reference values regenerated");
+    let done = await_condition(images, APPROVED_IMAGE_NAME, committed);
+    let ctx = "waiting for ApprovedImage to be committed after recreation";
+    timeout(scaled_duration(180), done).await.context(ctx)??;
+    test_ctx.info("ApprovedImage committed after recreation");
 
     test_ctx.cleanup().await?;
     Ok(())
@@ -745,42 +736,11 @@ async fn test_approved_image_readoption() -> anyhow::Result<()> {
 }
 
 named_test! {
-async fn test_combined_image_pcrs_configmap_updates() -> anyhow::Result<()> {
+async fn test_combined_image_pcrs() -> anyhow::Result<()> {
     let test_ctx = setup!([(COMBINE_PCRS_UPDATE_TEST_IMAGE_NAME, COMBINE_PCRS_UPDATE_TEST_IMAGE_REF)]).await?;
-    let client = test_ctx.client();
-    let namespace = test_ctx.namespace();
 
     // In practical terms it emulates a grub + kernel upgrade
     test_ctx.verify_expected_pcrs(&[&primary_pcrs!(), &secondary_pcrs!()]).await?;
-
-    let expected_ref_values = [
-        // PCR4
-        PRIMARY_PCR4_HASH,
-        MIX_PRIMARY_BOOT_SECONDARY_KERNEL_PCR4_HASH,
-        MIX_SECONDARY_BOOT_PRIMARY_KERNEL_PCR4_HASH,
-        SECONDARY_PCR4_HASH,
-        // PCR14
-        PCR14_HASH,
-    ];
-
-    let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-    let all_expected_pcrs = |cm: Option<&ConfigMap>| {
-        let data = cm.and_then(|cm| cm.data.as_ref());
-        let rv_json = data.and_then(|data| data.get("reference-values.json"));
-        if let Some(reference_values) = rv_json {
-            for value in expected_ref_values {
-                if !reference_values.contains(value) {
-                    return false;
-                }
-            }
-        } else {
-            return false;
-        }
-        true
-    };
-    let done = await_condition(configmaps, TRUSTEE_RV_MAP, all_expected_pcrs);
-    let ctx = "waiting for ConfigMap trustee-data to contain all expected pcrs";
-    timeout(scaled_duration(180), done).await.context(ctx)??;
 
     test_ctx.cleanup().await?;
     Ok(())

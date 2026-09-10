@@ -159,10 +159,6 @@ async fn install_trustee_configuration(
         .await
         .context("Failed to create the auth keys")?;
     info!("Generate auth keys for the KBS API");
-    trustee::generate_rv_data(client.clone(), owner_reference.clone())
-        .await
-        .context("Failed to create the reference values configmap")?;
-    info!("Created configmap for reference values");
     let kbs_port = cluster.spec.trustee_kbs_port;
     trustee::generate_kbs_service(client.clone(), owner_reference.clone(), kbs_port)
         .await
@@ -297,7 +293,6 @@ async fn main() -> Result<()> {
     attestation_key_register::launch_ak_controller(ctx.clone()).await;
     attestation_key_register::launch_machine_ak_controller(ctx.clone()).await;
     attestation_key_register::launch_secret_ak_controller(ctx.clone()).await;
-    reference_values::create_pcrs_config_map(kube_client.clone()).await?;
     reference_values::launch_rv_image_controller(ctx.clone()).await;
     reference_values::launch_rv_job_controller(ctx.clone()).await;
     trustee::launch_trustee_sync_controller(ctx.clone()).await;
@@ -436,27 +431,26 @@ mod tests {
         };
 
         // adopt_approved_images now reads from image_store (empty) — no GET needed.
-        // 9 POSTs for install, then 1 PATCH for final status.
+        // 8 POSTs for install, then 1 PATCH for final status.
         let clos = async |req: Request<Body>, ctr| {
-            if ctr < 9 && req.method() == Method::POST {
+            if ctr < 8 && req.method() == Method::POST {
                 use serde_json::to_string;
                 let resp = match ctr {
                     // install_trustee_configuration
                     0 => to_string(&ConfigMap::default()), // trustee-data
                     1 => to_string(&Secret::default()),    // trustee-auth
-                    2 => to_string(&ConfigMap::default()), // trustee-rv-data
-                    3 => to_string(&Service::default()),   // kbs-service
-                    4 => to_string(&Deployment::default()), // trustee-deployment
+                    2 => to_string(&Service::default()),   // kbs-service
+                    3 => to_string(&Deployment::default()), // trustee-deployment
                     // install_register_server
-                    5 => to_string(&Deployment::default()),
-                    6 => to_string(&Service::default()),
+                    4 => to_string(&Deployment::default()),
+                    5 => to_string(&Service::default()),
                     // install_attestation_key_register
-                    7 => to_string(&Deployment::default()),
-                    8 => to_string(&Service::default()),
+                    6 => to_string(&Deployment::default()),
+                    7 => to_string(&Service::default()),
                     _ => unreachable!("unexpected counter {ctr}"),
                 };
                 Ok(resp.unwrap())
-            } else if ctr == 9 && req.method() == Method::PATCH {
+            } else if ctr == 8 && req.method() == Method::PATCH {
                 let body = req.into_body().collect_bytes().await.unwrap().to_vec();
                 let body = String::from_utf8_lossy(&body);
                 assert!(body.contains("ForeignCondition"),);
@@ -487,7 +481,7 @@ mod tests {
         cluster.status = Some(TrustedExecutionClusterStatus {
             conditions: Some(vec![pre_existing_installed, foreign_condition]),
         });
-        count_check!(10, clos, |client| {
+        count_check!(9, clos, |client| {
             let result = reconcile(Arc::new(cluster), Arc::new(OperatorContext::new(client))).await;
             assert_eq!(result.unwrap(), LONG_REQUEUE);
         });

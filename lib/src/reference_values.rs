@@ -3,21 +3,58 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::{ApprovedImageStatusPcrs, ApprovedImageStatusPcrsEvents};
 use compute_pcrs_lib::Pcr;
-use k8s_openapi::jiff::Timestamp;
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use compute_pcrs_lib::tpmevents::TPMEvent;
 
-pub const PCR_CONFIG_MAP: &str = "image-pcrs";
-pub const PCR_CONFIG_FILE: &str = "image-pcrs.json";
 pub const IMAGE_VOLUME_MOUNTPOINT: &str = "/image";
-
-#[derive(Deserialize, Serialize)]
-pub struct ImagePcr {
-    pub first_seen: Timestamp,
-    pub pcrs: Vec<Pcr>,
-    pub reference: String,
+// Convert Pcrs to ApprovedImageStatusPcrs
+pub fn pcrs_to_status(pcrs: &[Pcr]) -> Vec<ApprovedImageStatusPcrs> {
+    pcrs.iter()
+        .map(|p| ApprovedImageStatusPcrs {
+            id: p.id as i64,
+            value: hex::encode(&p.value),
+            events: Some(
+                p.events
+                    .iter()
+                    .map(|e| ApprovedImageStatusPcrsEvents {
+                        name: e.name.clone(),
+                        pcr: e.pcr as i64,
+                        hash: hex::encode(&e.hash),
+                        id: format!("{:?}", e.id),
+                    })
+                    .collect(),
+            ),
+        })
+        .collect()
 }
 
-#[derive(Default, Deserialize, Serialize)]
-pub struct ImagePcrs(pub BTreeMap<String, ImagePcr>);
+// Convert ApprovedImageStatusPcrs to TPMEvents
+pub fn status_to_tpm_events(pcrs: &Vec<ApprovedImageStatusPcrs>) -> Vec<TPMEvent> {
+    pcrs.iter()
+        .flat_map(|p| {
+            p.events.as_ref().map_or_else(Vec::new, |events| {
+                events
+                    .iter()
+                    .filter_map(|e| {
+                        // Any event that is not found in the list of known events is ignored.
+                        let id = parse_tpm_event_id(&e.id)?;
+                        let hash = hex::decode(&e.hash).ok()?;
+                        // Ensure the PCR number is within the valid range.
+                        let pcr = u8::try_from(e.pcr).ok()?;
+                        Some(TPMEvent {
+                            name: e.name.clone(),
+                            pcr,
+                            hash,
+                            id,
+                        })
+                    })
+                    .collect()
+            })
+        })
+        .collect()
+}
+
+fn parse_tpm_event_id(s: &str) -> Option<compute_pcrs_lib::tpmevents::TPMEventID> {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+}

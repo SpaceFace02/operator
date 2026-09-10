@@ -8,8 +8,6 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use clevis_pin_trustee_lib::Key as ClevisKey;
-use compute_pcrs_lib::tpmevents::TPMEvent;
-use compute_pcrs_lib::tpmevents::combine::combine_images;
 use futures_util::StreamExt;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
@@ -21,7 +19,7 @@ use k8s_openapi::apimachinery::pkg::{
     apis::meta::v1::{LabelSelector, OwnerReference},
     util::intstr::IntOrString,
 };
-use kube::api::{ObjectMeta, Patch, PatchParams};
+use kube::api::ObjectMeta;
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::{reflector::ObjectRef, watcher};
 use kube::{Api, Client, Resource};
@@ -34,16 +32,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use compute_pcrs_lib::tpmevents::combine::combine_images;
 use operator::{ControllerError, OperatorContext, TLS_DIR, controller_error_policy};
 use operator::{controller_info, create_or_info_if_exists, read_certificate};
-use trusted_cluster_operator_lib::{endpoints::*, reference_values::*};
+use trusted_cluster_operator_lib::conditions::COMMITTED_CONDITION;
+use trusted_cluster_operator_lib::reference_values::status_to_tpm_events;
+use trusted_cluster_operator_lib::{ApprovedImage, ApprovedImageStatusPcrs, endpoints::*};
 
 const TRUSTEE_DATA_DIR: &str = "/etc/kbs";
 const KBS_CONFIG_FILE: &str = "kbs-config.toml";
 
 pub(crate) const TRUSTEE_DATA_MAP: &str = "trustee-data";
-pub(crate) const TRUSTEE_RV_MAP: &str = "trustee-rv-data";
-pub(crate) const REFERENCE_VALUES_FILE: &str = "reference-values.json";
 const TRUSTEE_AUTH_SECRET: &str = "trustee-auth";
 const TRUSTEE_AUTH_KEY_DIR: &str = "/opt/trustee/keys";
 const TRUSTEE_STORAGE_VOLUME: &str = "trustee-storage";
@@ -71,23 +70,24 @@ struct ReferenceValue {
     pub value: serde_json::Value,
 }
 
-pub fn get_image_pcrs(image_pcrs_map: &ConfigMap) -> Result<ImagePcrs> {
-    let err = "Image PCRs map existed, but had no data";
-    let image_pcrs_data = image_pcrs_map.data.as_ref().context(err)?;
-    let err = "Image PCRs data existed, but had no file";
-    let image_pcrs_str = image_pcrs_data.get(PCR_CONFIG_FILE).context(err)?;
-    serde_json::from_str(image_pcrs_str).map_err(Into::into)
-}
+/// PCR registers compared by tpm.rego.
+/// This is required to update reference values once a image is disallowed.
+/// reference values can only be updated, not deleted.
+/// on image disallow, we need to force update the reference values with the empty array.
+const ATTESTED_PCR_IDS: [i64; 2] = [4, 14];
 
-fn recompute_reference_values(image_pcrs: ImagePcrs) -> Vec<ReferenceValue> {
+fn recompute_reference_values(all_pcrs: &[Vec<ApprovedImageStatusPcrs>]) -> Vec<ReferenceValue> {
     let mut reference_values_in =
         BTreeMap::from([("svn".to_string(), BTreeSet::from(["1".to_string()]))]);
-    let tpm_events: Vec<Vec<TPMEvent>> = image_pcrs
-        .0
-        .values()
-        .map(|v| v.pcrs.iter().flat_map(|p| p.events.clone()).collect())
-        .collect();
+    // Safe default in case pcr computation fails.
+    for id in ATTESTED_PCR_IDS {
+        reference_values_in.entry(format!("pcr{id}")).or_default();
+    }
 
+    let tpm_events: Vec<Vec<_>> = all_pcrs
+        .iter()
+        .map(status_to_tpm_events)
+        .collect();
     let pcr_combinations = combine_images(&tpm_events);
     for pcr in pcr_combinations.iter().flatten() {
         reference_values_in
@@ -106,30 +106,37 @@ fn recompute_reference_values(image_pcrs: ImagePcrs) -> Vec<ReferenceValue> {
         .collect()
 }
 
-pub async fn update_reference_values(ctx: &OperatorContext, image_pcrs: ImagePcrs) -> Result<()> {
-    let reference_values = recompute_reference_values(image_pcrs);
-    let rv_json = serde_json::to_string(&reference_values)?;
+pub async fn update_reference_values(ctx: &OperatorContext) -> Result<()> {
+    let images: Api<ApprovedImage> = Api::default_namespaced(ctx.client.clone());
+    let image_list = images.list(&Default::default()).await?;
 
-    let config_maps: Api<ConfigMap> = Api::default_namespaced(ctx.client.clone());
-    let cm_data = BTreeMap::from([(REFERENCE_VALUES_FILE.to_string(), rv_json)]);
-    let cm = ConfigMap {
-        metadata: ObjectMeta {
-            name: Some(TRUSTEE_RV_MAP.to_string()),
-            ..Default::default()
-        },
-        data: Some(cm_data),
-        ..Default::default()
-    };
-    let patch = Patch::Apply(serde_json::to_value(cm)?);
-    let pp = PatchParams::apply("trusted-cluster-operator").force();
-    config_maps.patch(TRUSTEE_RV_MAP, &pp, &patch).await?;
+    let all_pcrs: Vec<Vec<ApprovedImageStatusPcrs>> = image_list
+        .items
+        .iter()
+        .filter(|img| img.metadata.deletion_timestamp.is_none())
+        .filter(|img| {
+            img.status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|cs| {
+                    cs.iter()
+                        .any(|c| c.type_ == COMMITTED_CONDITION && c.status == "True")
+                })
+        })
+        .filter_map(|img| img.status.as_ref().and_then(|s| s.pcrs.clone()))
+        .collect();
+
+    let reference_values = recompute_reference_values(&all_pcrs);
 
     if let Err(e) = sync_reference_values(ctx, &reference_values).await {
         warn!(
             "Failed to sync reference values to KBS (will retry on next deployment reconcile): {e}"
         );
     }
-    info!("Recomputed reference values");
+    info!(
+        "Recomputed reference values from {} committed images",
+        all_pcrs.len()
+    );
     Ok(())
 }
 
@@ -211,25 +218,6 @@ async fn sync_reference_values(
     Ok(())
 }
 
-async fn sync_reference_values_from_configmap(ctx: &OperatorContext) -> Result<()> {
-    let obj_ref = ObjectRef::new(TRUSTEE_RV_MAP).within(ctx.client.default_namespace());
-    let err_ctx = format!("missing ConfigMap {TRUSTEE_RV_MAP}");
-    let rv_map = ctx.cm_store.get(&obj_ref).context(err_ctx)?;
-    let data = rv_map.data.as_ref().context("RV ConfigMap has no data")?;
-    let rv_json = match data.get(REFERENCE_VALUES_FILE) {
-        Some(json) => json,
-        None => {
-            info!("No reference values in ConfigMap yet, skipping sync");
-            return Ok(());
-        }
-    };
-    let reference_values: Vec<ReferenceValue> = serde_json::from_str(rv_json)?;
-    if reference_values.is_empty() {
-        return Ok(());
-    }
-    sync_reference_values(ctx, &reference_values).await
-}
-
 pub async fn sync_resource_policy(ctx: &OperatorContext) -> Result<()> {
     let auth_token = get_auth_key_token(ctx)?;
     let (url, certs) = get_kbs_connection(ctx)?;
@@ -277,7 +265,7 @@ async fn trustee_deployment_reconcile(
             warn!("Failed to sync attestation policy to KBS: {e}");
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
-        if let Err(e) = sync_reference_values_from_configmap(&ctx).await {
+        if let Err(e) = update_reference_values(&ctx).await {
             warn!("Failed to sync reference values to KBS: {e}");
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
@@ -538,21 +526,6 @@ pub async fn generate_trustee_data(
     Ok(())
 }
 
-pub async fn generate_rv_data(client: Client, owner_reference: OwnerReference) -> Result<()> {
-    let data = BTreeMap::from([(REFERENCE_VALUES_FILE.to_string(), "[]".to_string())]);
-    let config_map = ConfigMap {
-        metadata: ObjectMeta {
-            name: Some(TRUSTEE_RV_MAP.to_string()),
-            owner_references: Some(vec![owner_reference]),
-            ..Default::default()
-        },
-        data: Some(data),
-        ..Default::default()
-    };
-    create_or_info_if_exists!(client, ConfigMap, config_map);
-    Ok(())
-}
-
 pub async fn generate_kbs_service(
     client: Client,
     owner_reference: OwnerReference,
@@ -719,15 +692,13 @@ pub async fn generate_kbs_deployment(
 mod tests {
     use super::*;
     use crate::test_utils::*;
-    use compute_pcrs_lib::Pcr;
-    use compute_pcrs_lib::tpmevents::TPMEventID;
     use http::{Method, Request, StatusCode};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use k8s_openapi::jiff::Timestamp;
-    use trusted_cluster_operator_test_utils::constants::*;
+    use kube::api::ObjectList;
+    use trusted_cluster_operator_lib::conditions::COMMITTED_CONDITION;
     use trusted_cluster_operator_test_utils::mock_client::*;
     use trusted_cluster_operator_test_utils::test_error_method;
-    use trusted_cluster_operator_test_utils::*;
 
     fn reference_values_from(reference_values: &[ReferenceValue], rv_name: &str) -> Vec<String> {
         let rv = reference_values
@@ -738,83 +709,29 @@ mod tests {
         val_arr.iter().map(|v| v.as_str().unwrap().into()).collect()
     }
 
-    #[test]
-    fn test_get_image_pcrs_success() {
-        let config_map = dummy_pcrs_map();
-        let image_pcrs = get_image_pcrs(&config_map).unwrap();
-        assert_eq!(image_pcrs.0["cos"].pcrs.len(), 2);
-        assert_eq!(
-            hex::encode(&image_pcrs.0["cos"].pcrs[0].value),
-            DUMMY_PCR_4_VALUE
-        );
-        assert_eq!(
-            hex::encode(&image_pcrs.0["cos"].pcrs[1].value),
-            "e58ada1ba75f2e4722b539824598ad5e10c55f2e4aeab2033f3b0a8ee3f3eca6"
-        );
-    }
-
-    #[test]
-    fn test_get_image_pcrs_no_data() {
-        let config_map = ConfigMap::default();
-        let err = get_image_pcrs(&config_map).err().unwrap();
-        assert!(err.to_string().contains("but had no data"));
-    }
-
-    #[test]
-    fn test_get_image_pcrs_no_file() {
-        let config_map = ConfigMap {
-            data: Some(BTreeMap::new()),
-            ..Default::default()
-        };
-        let err = get_image_pcrs(&config_map).err().unwrap();
-        assert!(err.to_string().contains("but had no file"));
-    }
-
-    #[test]
-    fn test_get_image_pcrs_invalid_json() {
-        let data = BTreeMap::from([(PCR_CONFIG_FILE.to_string(), "not json".to_string())]);
-        let config_map = ConfigMap {
-            data: Some(data),
-            ..Default::default()
-        };
-        assert!(get_image_pcrs(&config_map).is_err());
-    }
-
-    #[test]
-    fn test_recompute_reference_values() {
-        let result = recompute_reference_values(dummy_pcrs());
-        assert_eq!(result.len(), 3);
-        let vals = reference_values_from(&result, "tpm_pcr4");
-        assert_eq!(vals, vec![DUMMY_PCR_4_VALUE,]);
-        let vals = reference_values_from(&result, "tpm_pcr7");
-        assert_eq!(vals, vec![DUMMY_PCR_7_VALUE,]);
-    }
 
     #[tokio::test]
     async fn test_update_rvs_success() {
         let _ = jsonwebtoken_openssl::install_default();
-        let clos = async |req: Request<_>, ctr| match req.method() {
-            &Method::PATCH => {
-                assert!(req.uri().path().contains(TRUSTEE_RV_MAP));
-                Ok(serde_json::to_string(&dummy_trustee_map()).unwrap())
+        let clos = async |req: Request<_>, ctr| match (ctr, req.method()) {
+            (0, &Method::GET) => {
+                let image = committed_approved_image("cos", dummy_status_pcrs());
+                let list = ObjectList {
+                    items: vec![image],
+                    types: Default::default(),
+                    metadata: Default::default(),
+                };
+                Ok(serde_json::to_string(&list).unwrap())
             }
             _ => panic!("unexpected API interaction: {req:?}, counter {ctr}"),
         };
         count_check!(1, clos, |client| {
-            let ctx = OperatorContext::new(client);
-            assert!(update_reference_values(&ctx, dummy_pcrs()).await.is_ok());
-        });
-    }
-
-    #[tokio::test]
-    async fn test_update_rvs_no_trustee_map() {
-        let clos = async |req: Request<_>, _| match req.method() {
-            &Method::PATCH => Err(StatusCode::NOT_FOUND),
-            _ => panic!("unexpected API interaction: {req:?}"),
-        };
-        count_check!(1, clos, |client| {
-            let ctx = OperatorContext::new(client);
-            assert!(update_reference_values(&ctx, dummy_pcrs()).await.is_err())
+            let mut auth = dummy_trustee_auth();
+            auth.metadata.name = Some(TRUSTEE_AUTH_SECRET.to_string());
+            let mut ctx = OperatorContext::new(client);
+            ctx.secret_store = store_with(vec![auth]);
+            ctx.tec_store = store_with(vec![dummy_cluster()]);
+            assert!(update_reference_values(&ctx).await.is_ok());
         });
     }
 
@@ -899,107 +816,6 @@ mod tests {
     async fn test_generate_kbs_depl_error() {
         let clos = |client| generate_kbs_deployment(client, Default::default(), "image", &None);
         test_error_method!(clos, Method::POST);
-    }
-
-    #[test]
-    fn test_recompute_reference_values_pcr4() {
-        let cos2_pcr4_hash = "c7fc63ec604348d8258993a9e344ba72041afd1473ad291a3171199b551aedbd";
-        let image_pcrs = ImagePcrs(BTreeMap::from([
-            (
-                "cos1".to_string(),
-                ImagePcr {
-                    first_seen: Timestamp::now(),
-                    pcrs: vec![primary_pcr4!(), expected_pcr7!()],
-                    reference: "".to_string(),
-                },
-            ),
-            (
-                "cos2".to_string(),
-                ImagePcr {
-                    first_seen: Timestamp::now(),
-                    pcrs: vec![Pcr {
-                        id: 4,
-                        value: hex::decode(cos2_pcr4_hash).unwrap(),
-                        events: vec![
-                            pcr4_ev_efi_action_event!(),
-                            pcr_separator_event!(4, TPMEventID::Pcr4Separator),
-                            TPMEvent {
-                                name: "EV_EFI_BOOT_SERVICES_APPLICATION".into(),
-                                pcr: 4,
-                                hash: hex::decode("1fed6fad5ca735adc80615d2a7e795e2f17f84e407b07979498c9edb1e04383f")
-                                    .unwrap(),
-                                id: TPMEventID::Pcr4Shim,
-                            },
-                            TPMEvent {
-                                name: "EV_EFI_BOOT_SERVICES_APPLICATION".into(),
-                                pcr: 4,
-                                hash: hex::decode("8f3adc6b42da2defa6d5ef3202badc39a5a22ceec068f106760592163a505a0e")
-                                    .unwrap(),
-                                id: TPMEventID::Pcr4Grub,
-                            },
-                            TPMEvent {
-                                name: "EV_EFI_BOOT_SERVICES_APPLICATION".into(),
-                                pcr: 4,
-                                hash: hex::decode("772c3a90820e4a76944d3715e6f700bc41e846b0049b7817f9feb3289a56d3f8")
-                                    .unwrap(),
-                                id: TPMEventID::Pcr4Vmlinuz,
-                            },
-                        ],
-                    },
-                    expected_pcr7!()],
-                    reference: "".to_string(),
-                },
-            ),
-        ]));
-
-        let result = recompute_reference_values(image_pcrs);
-        assert_eq!(result.len(), 3);
-        let vals_pcr4 = reference_values_from(&result, "tpm_pcr4");
-        assert_eq!(
-            vals_pcr4,
-            vec![
-                "514259b499f88d74cce9ff4763bb95d5c4e9a6703df48467a99dbcae02c3d974",
-                cos2_pcr4_hash,
-                "c9c3add791efc98f59977c89e673a34ad0b357872e9eb2c43d14607488e5d9e2",
-                PRIMARY_PCR4_HASH
-            ]
-        );
-        let vals_pcr7 = reference_values_from(&result, "tpm_pcr7");
-        assert_eq!(vals_pcr7, vec![PCR7_HASH]);
-    }
-    #[tokio::test]
-    async fn test_generate_rv_data_success() {
-        let clos = |client| generate_rv_data(client, Default::default());
-        test_create_success::<_, _, ConfigMap>(clos).await;
-    }
-
-    #[tokio::test]
-    async fn test_generate_rv_data_already_exists() {
-        let clos = |client| generate_rv_data(client, Default::default());
-        test_create_already_exists(clos).await;
-    }
-
-    #[tokio::test]
-    async fn test_generate_rv_data_error() {
-        let clos = |client| generate_rv_data(client, Default::default());
-        test_error_method!(clos, Method::POST);
-    }
-
-    #[test]
-    fn test_recompute_reference_values_includes_svn() {
-        let result = recompute_reference_values(dummy_pcrs());
-        let svn = result.iter().find(|rv| rv.name == "tpm_svn").unwrap();
-        let vals = svn.value.as_array().unwrap();
-        assert_eq!(vals.len(), 1);
-        assert_eq!(vals[0].as_str().unwrap(), "1");
-    }
-
-    #[test]
-    fn test_recompute_reference_values_version() {
-        let result = recompute_reference_values(dummy_pcrs());
-        for rv in &result {
-            assert_eq!(rv.version, "0.1.0");
-        }
     }
 
     #[tokio::test]
