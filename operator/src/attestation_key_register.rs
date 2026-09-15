@@ -273,6 +273,7 @@ async fn approve_ak(ak: &AttestationKey, machine: &Machine, ctx: &OperatorContex
     let obj_ref = ObjectRef::new(&secret_name).within(client.default_namespace());
     let secret_exists = ctx.secret_store.get(&obj_ref).is_some();
 
+    let secrets: Api<Secret> = Api::default_namespaced(client.clone());
     if !secret_exists {
         let public_key_data = ByteString(ak.spec.public_key.as_bytes().to_vec());
         let data = BTreeMap::from([("public_key".to_string(), public_key_data)]);
@@ -296,6 +297,9 @@ async fn approve_ak(ak: &AttestationKey, machine: &Machine, ctx: &OperatorContex
 
         create_or_info_if_exists!(client.clone(), Secret, secret);
         info!("Created secret {secret_name} for attestation key {name} with finalizer");
+    } else {
+        // Ensures the AttestationKey secret has the label the secret controller watches on.
+        ensure_secret_label(&secrets, &secret_name).await?;
     }
 
     let machine_condition =
@@ -312,6 +316,33 @@ async fn approve_ak(ak: &AttestationKey, machine: &Machine, ctx: &OperatorContex
         info!("Set AttestationKeyApproved condition on Machine {machine_name}");
     }
 
+    Ok(())
+}
+
+// Secrets created by older operator versions lack the label, as older operator versions watched all secrets, without label filters.
+async fn ensure_secret_label(secrets: &Api<Secret>, name: &str) -> Result<()> {
+    let Some(secret) = secrets.get_opt(name).await? else {
+        return Ok(());
+    };
+    let has_label = secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(KIND_LABEL_KEY))
+        .is_some_and(|v| v == ATTESTATION_KEY_LABEL_VALUE);
+    if !has_label {
+        let patch = json!({
+            "metadata": {
+                "labels": {
+                    KIND_LABEL_KEY: ATTESTATION_KEY_LABEL_VALUE
+                }
+            }
+        });
+        secrets
+            .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        info!("Patched missing {KIND_LABEL_KEY} label onto secret {name}");
+    }
     Ok(())
 }
 
@@ -461,5 +492,20 @@ mod tests {
         let clos =
             |client| create_attestation_key_register_service(client, Default::default(), Some(80));
         test_error_method!(clos, Method::POST);
+    }
+
+    // Once the operator version passes 0.5, the ensure_secret_label shim in approve_ak (for secrets created by pre-label operator versions) should be revertible.
+    #[test]
+    fn test_operator_version_below_0_5_needs_ensure_secret_label() {
+        let version = env!("CARGO_PKG_VERSION");
+        let mut parts = version.split('.');
+        let parse = |p: Option<&str>| p.and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+        let major = parse(parts.next());
+        let minor = parse(parts.next());
+        assert!(
+            major == 0 && minor <= 5,
+            "operator version {version} is greater than 0.5: revert the ensure_secret_label \
+             shim in approve_ak, it might no longer be needed"
+        );
     }
 }
