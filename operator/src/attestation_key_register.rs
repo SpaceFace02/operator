@@ -323,37 +323,61 @@ async fn secret_reconcile(
     info!("Secret reconciliation for AttestationKey secret: {secret_name}");
 
     let secrets: Api<Secret> = Api::default_namespaced(ctx.client.clone());
-    finalizer(&secrets, ATTESTATION_KEY_SECRET_FINALIZER, secret, |ev| async move {
-        match ev {
-            Event::Apply(_secret) => {
-                // On creation/update, just update the AK via trustee API
-                trustee::update_attestation_keys(&ctx)
-                    .await
-                    .map(|_| LONG_REQUEUE)
-                    .map_err(|e| {
-                        warn!("Error updating attestation key volumes on secret apply: {e}");
-                        warn!("Error updating attestation key on secret apply: {e}");
-                        finalizer::Error::<ControllerError>::ApplyFailed(e.into())
-                    })
-            }
-            Event::Cleanup(secret) => {
-                let secret_name = secret.metadata.name.clone().unwrap_or_default();
-                info!(
-                    "AttestationKey secret {secret_name} is being deleted, updating trustee deployment volumes"
-                );
-                // Update trustee deployment - secrets with deletion_timestamp will be filtered out
-                trustee::update_attestation_keys(&ctx)
-                    .await
-                    .map(|_| LONG_REQUEUE)
-                    .map_err(|e| {
-                        warn!(
-                            "Error updating attestation key during secret deletion: {e}"
+    finalizer(
+        &secrets,
+        ATTESTATION_KEY_SECRET_FINALIZER,
+        secret,
+        |ev| async move {
+            match ev {
+                Event::Apply(_secret) => {
+                    // On creation/update, just update the AK via trustee API
+                    trustee::update_attestation_keys(&ctx)
+                        .await
+                        .map(|_| LONG_REQUEUE)
+                        .map_err(|e| {
+                            warn!("Error updating attestation key volumes on secret apply: {e}");
+                            warn!("Error updating attestation key on secret apply: {e}");
+                            finalizer::Error::<ControllerError>::ApplyFailed(e.into())
+                        })
+                }
+                Event::Cleanup(secret) => {
+                    let secret_name = secret.metadata.name.clone().unwrap_or_default();
+
+                    // If TEC is already being deleted, trustee will be deleted too, so no need to update it.
+                    // Only skip the update on a confirmed deletion_timestamp
+                    let tec_deleting = match ctx.get_opt_tec() {
+                        Ok(Some(tec)) => tec.metadata.deletion_timestamp.is_some(),
+                        Ok(None) => false,
+                        Err(e) => {
+                            warn!(
+                                "Failed to check TrustedExecutionCluster deletion state, \
+                                 defaulting to updating trustee: {e}"
+                            );
+                            false
+                        }
+                    };
+
+                    if tec_deleting {
+                        info!(
+                            "TrustedExecutionCluster is being deleted, \
+                         skipping trustee update for AttestationKey secret {secret_name}"
                         );
-                        finalizer::Error::<ControllerError>::CleanupFailed(e.into())
-                    })
+                        return Ok(LONG_REQUEUE);
+                    }
+
+                    info!("AttestationKey secret {secret_name} is being deleted, updating trustee");
+                    // Update trustee deployment - secrets with deletion_timestamp will be filtered out
+                    trustee::update_attestation_keys(&ctx)
+                        .await
+                        .map(|_| LONG_REQUEUE)
+                        .map_err(|e| {
+                            warn!("Error updating attestation key during secret deletion: {e}");
+                            finalizer::Error::<ControllerError>::CleanupFailed(e.into())
+                        })
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .map_err(|e| anyhow!("failed to reconcile attestation key secret: {e}").into())
 }
