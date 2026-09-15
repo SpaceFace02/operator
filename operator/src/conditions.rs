@@ -133,3 +133,27 @@ pub fn attestation_key_approved_condition(
         observed_generation: generation,
     }
 }
+
+pub fn upgrade_condition(
+    type_: &str,
+    reason: &str,
+    generation: Option<i64>,
+    existing_status: &Option<TrustedExecutionClusterStatus>,
+    detail: Option<&str>,
+) -> Condition {
+    let status = condition_status(reason == UPGRADE_COMPLETE);
+    let message = match (reason, detail) {
+        (UPGRADE_FAILED, Some(d)) => format!("Upgrade failed: {d}. Manual intervention required."),
+        (UPGRADE_IN_PROGRESS, _) => "Operator upgrade is in progress".to_string(),
+        (UPGRADE_COMPLETE, _) => "Operator upgrade completed successfully".to_string(),
+        _ => String::new(),
+    };
+    Condition {
+        type_: type_.to_string(),
+        reason: reason.to_string(),
+        message,
+        last_transition_time: transition_time(existing_status, type_, &status),
+        status,
+        observed_generation: generation,
+    }
+}
