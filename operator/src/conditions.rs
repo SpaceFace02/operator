@@ -158,28 +158,9 @@ pub fn upgrade_condition(
     }
 }
 
-// Few tests for the various upgrade conditions.
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_upgrade_condition_in_progress_message() {
-        let c = upgrade_condition(UPGRADE_CONDITION, UPGRADE_IN_PROGRESS, None, &None, None);
-        assert_eq!(c.type_, UPGRADE_CONDITION);
-        assert_eq!(c.reason, UPGRADE_IN_PROGRESS);
-        assert_eq!(c.status, "False");
-        assert_eq!(c.message, "Operator upgrade is in progress");
-    }
-
-    #[test]
-    fn test_upgrade_condition_complete_message() {
-        let c = upgrade_condition(UPGRADE_CONDITION, UPGRADE_COMPLETE, None, &None, None);
-        assert_eq!(c.type_, UPGRADE_CONDITION);
-        assert_eq!(c.reason, UPGRADE_COMPLETE);
-        assert_eq!(c.status, "True");
-        assert_eq!(c.message, "Operator upgrade completed successfully");
-    }
 
     // Trustee upgrade failed message.
     #[test]

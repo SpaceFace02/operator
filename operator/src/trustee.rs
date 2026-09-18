@@ -34,10 +34,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::get_condition;
 use compute_pcrs_lib::tpmevents::combine::combine_images;
 use operator::{ControllerError, OperatorContext, TLS_DIR, controller_error_policy};
 use operator::{controller_info, create_or_info_if_exists, read_certificate};
-use trusted_cluster_operator_lib::conditions::COMMITTED_CONDITION;
+use trusted_cluster_operator_lib::conditions::{COMMITTED_CONDITION, COMMITTED_REASON};
 use trusted_cluster_operator_lib::reference_values::status_to_tpm_events;
 use trusted_cluster_operator_lib::{ApprovedImage, ApprovedImageStatusPcrs, endpoints::*};
 
@@ -116,15 +117,7 @@ pub async fn update_reference_values(ctx: &OperatorContext) -> Result<()> {
         .items
         .iter()
         .filter(|img| img.metadata.deletion_timestamp.is_none())
-        .filter(|img| {
-            img.status
-                .as_ref()
-                .and_then(|s| s.conditions.as_ref())
-                .is_some_and(|cs| {
-                    cs.iter()
-                        .any(|c| c.type_ == COMMITTED_CONDITION && c.status == "True")
-                })
-        })
+        .filter(|img| get_condition(img.status.as_ref(), COMMITTED_CONDITION, COMMITTED_REASON))
         .filter_map(|img| img.status.as_ref().and_then(|s| s.pcrs.clone()))
         .collect();
 

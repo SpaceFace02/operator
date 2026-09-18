@@ -23,8 +23,8 @@ use operator::OperatorContext;
 use operator::{generate_owner_reference, spawn_reflector, sync_cache, upsert_condition};
 use trusted_cluster_operator_lib::endpoints::*;
 use trusted_cluster_operator_lib::{
-    ApprovedImage, ApprovedImageStatus, AttestationKey, Machine, TrustedExecutionCluster,
-    TrustedExecutionClusterStatus, committed_condition,
+    ApprovedImage, ApprovedImageStatus, AttestationKey, Conditions, Machine,
+    TrustedExecutionCluster, TrustedExecutionClusterStatus, committed_condition,
 };
 use trusted_cluster_operator_lib::{conditions::*, images::*, update_status};
 
@@ -61,12 +61,18 @@ const TEC_REGISTRY: &str = "quay.io/trusted-execution-clusters";
 /// exec/attach operations without traffic for more than 5 minutes, but we do not use those.
 const KUBE_READ_TIMEOUT: Duration = Duration::from_secs(295);
 
-fn is_installed(status: Option<TrustedExecutionClusterStatus>) -> bool {
-    let chk = |c: &Condition| c.type_ == INSTALLED_CONDITION && c.status == "True";
+/// Checks whether `status` has a condition with the given type and reason.
+pub(crate) fn get_condition<S: Conditions>(
+    status: Option<&S>,
+    condition_type: &str,
+    reason: &str,
+) -> bool {
     status
-        .and_then(|s| s.conditions)
-        .map(|cs| cs.iter().any(chk))
-        .unwrap_or(false)
+        .and_then(|s| s.conditions().as_ref())
+        .is_some_and(|cs| {
+            cs.iter()
+                .any(|c| c.type_ == condition_type && c.reason == reason)
+        })
 }
 
 async fn reconcile(
@@ -90,85 +96,180 @@ async fn reconcile(
     let clusters: Api<TrustedExecutionCluster> = Api::default_namespaced(kube_client.clone());
 
     if cluster.metadata.deletion_timestamp.is_some() {
-        info!("Registered deletion of TrustedExecutionCluster {name}");
-        let uninstalling_reason = NOT_INSTALLED_REASON_UNINSTALLING;
-        let uninstall_condition =
-            installed_condition(uninstalling_reason, generation, existing_status);
-        let changed = upsert_condition(&mut conditions, uninstall_condition);
-        if changed {
-            update_status!(
-                clusters,
-                name,
-                TrustedExecutionClusterStatus {
-                    conditions,
-                    observed_operator_version: None
-                }
-            )?;
-        }
-
-        return Ok(LONG_REQUEUE);
+        return Ok(handle_deletion(
+            &clusters,
+            name,
+            generation,
+            existing_status,
+            &mut conditions,
+        )
+        .await?);
     }
 
     if ctx.tec_store.state().len() > 1 {
-        let namespace = kube_client.default_namespace();
-        warn!(
-            "More than one TrustedExecutionCluster found in namespace {namespace}. \
-             trusted-cluster-operator does not support more than one TrustedExecutionCluster. Requeueing...",
-        );
-        let non_unique_condition =
-            installed_condition(NOT_INSTALLED_REASON_NON_UNIQUE, generation, existing_status);
-        let changed = upsert_condition(&mut conditions, non_unique_condition);
-        if changed {
-            update_status!(
-                clusters,
-                name,
-                TrustedExecutionClusterStatus {
-                    conditions,
-                    observed_operator_version: None
-                }
-            )?;
-        }
-        return Ok(Action::requeue(Duration::from_secs(60)));
-    }
-
-    if is_installed(cluster.status.clone()) {
-        // Get the observed operator version from the status.
-        let observed = cluster
-            .status
-            .as_ref()
-            .and_then(|s| s.observed_operator_version.as_deref());
-
-        // No need to upgrade if the version is the same as the COMPONENT_VERSION.
-        if observed == Some(COMPONENT_VERSION) {
-            return Ok(LONG_REQUEUE);
-        }
-
-        // A previous upgrade failed and requires manual intervention;
-        // do not retry automatically.
-        let live = clusters.get(name).await.map_err(anyhow::Error::from)?;
-        let has_failed = live
-            .status
-            .as_ref()
-            .and_then(|s| s.conditions.as_ref())
-            .is_some_and(|cs| {
-                cs.iter()
-                    .any(|c| c.type_ == UPGRADE_CONDITION && c.reason == UPGRADE_FAILED)
-            });
-        if has_failed {
-            return Ok(LONG_REQUEUE);
-        }
-
-        // UPGRADE BRANCH
-        info!("Upgrading TrustedExecutionCluster {name} from {observed:?} to {COMPONENT_VERSION}");
-        let upgrade_cond = upgrade_condition(
-            UPGRADE_CONDITION,
-            UPGRADE_IN_PROGRESS,
+        return Ok(handle_non_unique(
+            &ctx,
+            &clusters,
+            name,
             generation,
             existing_status,
-            None,
-        );
+            &mut conditions,
+        )
+        .await?);
+    }
 
-        upsert_condition(&mut conditions, upgrade_cond);
+    if let Some(action) = handle_upgrade(
+        &ctx,
+        &cluster,
+        &clusters,
+        name,
+        generation,
+        existing_status,
+        &mut conditions,
+    )
+    .await?
+    {
+        return Ok(action);
+    }
+
+    Ok(handle_fresh_install(
+        &kube_client,
+        &clusters,
+        &cluster,
+        &ctx,
+        name,
+        generation,
+        existing_status,
+        &mut conditions,
+    )
+    .await?)
+}
+
+async fn handle_deletion(
+    clusters: &Api<TrustedExecutionCluster>,
+    name: &str,
+    generation: Option<i64>,
+    existing_status: &Option<TrustedExecutionClusterStatus>,
+    conditions: &mut Option<Vec<Condition>>,
+) -> Result<Action> {
+    info!("Registered deletion of TrustedExecutionCluster {name}");
+    let uninstall_condition = installed_condition(
+        NOT_INSTALLED_REASON_UNINSTALLING,
+        generation,
+        existing_status,
+    );
+    let changed = upsert_condition(conditions, uninstall_condition);
+    if changed {
+        update_status!(
+            clusters,
+            name,
+            TrustedExecutionClusterStatus {
+                conditions: conditions.clone(),
+                observed_operator_version: None
+            }
+        )?;
+    }
+    Ok(LONG_REQUEUE)
+}
+
+async fn handle_non_unique(
+    ctx: &OperatorContext,
+    clusters: &Api<TrustedExecutionCluster>,
+    name: &str,
+    generation: Option<i64>,
+    existing_status: &Option<TrustedExecutionClusterStatus>,
+    conditions: &mut Option<Vec<Condition>>,
+) -> Result<Action> {
+    let namespace = ctx.client.default_namespace();
+    warn!(
+        "More than one TrustedExecutionCluster found in namespace {namespace}. \
+         trusted-cluster-operator does not support more than one TrustedExecutionCluster. Requeueing...",
+    );
+    let non_unique_condition =
+        installed_condition(NOT_INSTALLED_REASON_NON_UNIQUE, generation, existing_status);
+    let changed = upsert_condition(conditions, non_unique_condition);
+    if changed {
+        update_status!(
+            clusters,
+            name,
+            TrustedExecutionClusterStatus {
+                conditions: conditions.clone(),
+                observed_operator_version: None
+            }
+        )?;
+    }
+    Ok(Action::requeue(Duration::from_secs(60)))
+}
+
+/// Checks whether the cluster is installed and, if so, whether it needs an upgrade.
+/// Returns `None` when the cluster is not installed yet, and recncile falls through to the fresh-install path.
+async fn handle_upgrade(
+    ctx: &Arc<OperatorContext>,
+    cluster: &TrustedExecutionCluster,
+    clusters: &Api<TrustedExecutionCluster>,
+    name: &str,
+    generation: Option<i64>,
+    existing_status: &Option<TrustedExecutionClusterStatus>,
+    conditions: &mut Option<Vec<Condition>>,
+) -> Result<Option<Action>> {
+    // If not installed.
+    if !get_condition(
+        existing_status.as_ref(),
+        INSTALLED_CONDITION,
+        INSTALLED_REASON,
+    ) {
+        return Ok(None);
+    }
+
+    // Get the observed operator version from the status.
+    let observed = existing_status
+        .as_ref()
+        .and_then(|s| s.observed_operator_version.as_deref());
+
+    // No need to upgrade if the version is the same as the COMPONENT_VERSION.
+    if observed == Some(COMPONENT_VERSION) {
+        return Ok(Some(LONG_REQUEUE));
+    }
+
+    // A previous upgrade failed and requires manual intervention;
+    // do not retry automatically.
+    let live = clusters.get(name).await?;
+    if get_condition(live.status.as_ref(), UPGRADE_CONDITION, UPGRADE_FAILED) {
+        return Ok(Some(LONG_REQUEUE));
+    }
+
+    info!("Upgrading TrustedExecutionCluster {name} from {observed:?} to {COMPONENT_VERSION}");
+    let upgrade_cond = upgrade_condition(
+        UPGRADE_CONDITION,
+        UPGRADE_IN_PROGRESS,
+        generation,
+        existing_status,
+        None,
+    );
+    upsert_condition(conditions, upgrade_cond);
+    let status = TrustedExecutionClusterStatus {
+        conditions: conditions.clone(),
+        observed_operator_version: existing_status
+            .as_ref()
+            .and_then(|s| s.observed_operator_version.clone()),
+    };
+    update_status!(clusters, name, status)?;
+
+    // Run the upgrade
+    let upgrade_result = run_upgrade(ctx, cluster, conditions, generation, existing_status).await;
+
+    // If the upgrade fails, set the Upgrade=Failed condition and return.
+    if let Err(e) = upgrade_result {
+        warn!("Upgrade failed: {e:?}. Setting Upgrade=Failed.");
+
+        let failed = upgrade_condition(
+            UPGRADE_CONDITION,
+            UPGRADE_FAILED,
+            generation,
+            existing_status,
+            Some(&format!("{e:#}")),
+        );
+        upsert_condition(conditions, failed);
         let status = TrustedExecutionClusterStatus {
             conditions: conditions.clone(),
             observed_operator_version: existing_status
@@ -176,56 +277,41 @@ async fn reconcile(
                 .and_then(|s| s.observed_operator_version.clone()),
         };
         update_status!(clusters, name, status)?;
-
-        // Run the upgrade
-        let upgrade_result =
-            run_upgrade(&ctx, &cluster, &mut conditions, generation, existing_status).await;
-
-        // If the upgrade fails, set the Upgrade=Failed condition and return.
-        if let Err(e) = upgrade_result {
-            warn!("Upgrade failed: {e:?}. Setting Upgrade=Failed.");
-
-            let failed = upgrade_condition(
-                UPGRADE_CONDITION,
-                UPGRADE_FAILED,
-                generation,
-                existing_status,
-                Some(&format!("{e:#}")),
-            );
-            upsert_condition(&mut conditions, failed);
-            let status = TrustedExecutionClusterStatus {
-                conditions,
-                observed_operator_version: existing_status
-                    .as_ref()
-                    .and_then(|s| s.observed_operator_version.clone()),
-            };
-            update_status!(clusters, name, status)?;
-            return Ok(LONG_REQUEUE);
-        }
-
-        let upgrade_done = upgrade_condition(
-            UPGRADE_CONDITION,
-            UPGRADE_COMPLETE,
-            generation,
-            existing_status,
-            None,
-        );
-        upsert_condition(&mut conditions, upgrade_done);
-
-        // Only updating observed_operator_version with COMPONENT_VERSION if the upgrade was successful.
-        let status = TrustedExecutionClusterStatus {
-            conditions,
-            observed_operator_version: Some(COMPONENT_VERSION.to_string()),
-        };
-        update_status!(clusters, name, status)?;
-        return Ok(LONG_REQUEUE);
+        return Ok(Some(LONG_REQUEUE));
     }
 
-    // FRESH COMPONENT INSTALL BRANCH
+    let upgrade_done = upgrade_condition(
+        UPGRADE_CONDITION,
+        UPGRADE_COMPLETE,
+        generation,
+        existing_status,
+        None,
+    );
+    upsert_condition(conditions, upgrade_done);
+
+    // Only updating observed_operator_version with COMPONENT_VERSION if the upgrade was successful.
+    let status = TrustedExecutionClusterStatus {
+        conditions: conditions.clone(),
+        observed_operator_version: Some(COMPONENT_VERSION.to_string()),
+    };
+    update_status!(clusters, name, status)?;
+    Ok(Some(LONG_REQUEUE))
+}
+
+async fn handle_fresh_install(
+    kube_client: &Client,
+    clusters: &Api<TrustedExecutionCluster>,
+    cluster: &TrustedExecutionCluster,
+    ctx: &Arc<OperatorContext>,
+    name: &str,
+    generation: Option<i64>,
+    existing_status: &Option<TrustedExecutionClusterStatus>,
+    conditions: &mut Option<Vec<Condition>>,
+) -> Result<Action> {
     info!("Setting up TrustedExecutionCluster {name}");
     let installing_condition =
         installed_condition(NOT_INSTALLED_REASON_INSTALLING, generation, existing_status);
-    let changed = upsert_condition(&mut conditions, installing_condition);
+    let changed = upsert_condition(conditions, installing_condition);
     // Not setting observed_operator_version here, as it will be updated only once the fresh install has completed successfully.
     if changed {
         let status = TrustedExecutionClusterStatus {
@@ -235,19 +321,19 @@ async fn reconcile(
         update_status!(clusters, name, status)?;
     }
 
-    if let Err(e) = install_components(&kube_client, &cluster).await {
+    if let Err(e) = install_components(kube_client, cluster).await {
         // warn with `:?` to also get context
         warn!("Installation of a component failed: {e:?}\nRequeueing...");
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
-    reference_values::adopt_approved_images(&ctx, &cluster).await?;
+    reference_values::adopt_approved_images(ctx, cluster).await?;
 
     // Updating observed_operator_version because the fresh install is complete.
     let installed_condition = installed_condition(INSTALLED_REASON, generation, existing_status);
-    let changed = upsert_condition(&mut conditions, installed_condition);
+    let changed = upsert_condition(conditions, installed_condition);
     if changed {
         let status = TrustedExecutionClusterStatus {
-            conditions,
+            conditions: conditions.clone(),
             observed_operator_version: Some(COMPONENT_VERSION.to_string()),
         };
         update_status!(clusters, name, status)?;
@@ -344,7 +430,7 @@ fn deployment_rollout_complete(depl: &Deployment) -> bool {
     // The observed generation is at least as new as the desired generation. This ensures a new replicaset has rolled out.
     let generation_seen =
         status.observed_generation.unwrap_or(0) >= depl.metadata.generation.unwrap_or(0);
-    // Atleast 1 replica is available
+    // At least 1 replica is available
     let desired = depl.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
     let replicas = status.replicas.unwrap_or(0);
     let updated = status.updated_replicas.unwrap_or(0);
@@ -520,7 +606,7 @@ async fn converge_related_image(
     deployments
         .patch(
             deployment_name,
-            &kube::api::PatchParams::apply("trusted-cluster-operator"),
+            &kube::api::PatchParams::default(),
             &kube::api::Patch::Strategic(patch),
         )
         .await

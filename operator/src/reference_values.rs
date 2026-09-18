@@ -30,6 +30,7 @@ use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use crate::COMPONENT_VERSION;
+use crate::get_condition;
 use crate::trustee;
 use operator::{ControllerError, KIND_LABEL_KEY, LONG_REQUEUE, OperatorContext, upsert_condition};
 use operator::{controller_error_policy, controller_info, create_or_info_if_exists};
@@ -427,14 +428,7 @@ pub async fn handle_new_image(
     let resource_name = image.metadata.name.as_ref().unwrap();
     let boot_image: &str = &image.spec.image;
 
-    let is_committed = image
-        .status
-        .as_ref()
-        .and_then(|s| s.conditions.as_ref())
-        .is_some_and(|cs| {
-            cs.iter()
-                .any(|c| c.type_ == COMMITTED_CONDITION && c.status == "True")
-        });
+    let is_committed = get_condition(image.status.as_ref(), COMMITTED_CONDITION, COMMITTED_REASON);
     if is_committed
         && image
             .status

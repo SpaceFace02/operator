@@ -294,7 +294,9 @@ async fn test_real_version_upgrade() -> anyhow::Result<()> {
 
     // ------------------------------ Phase 3: Bad Trustee upgrade (should result in Upgrade=Failed) ----------------------------------
     // Phase 3: A subsequent bad Trustee upgrade must fail without disrupting the now-current (v0.20.0) Trustee. Reuses the already-booted VM: no second boot.
-    // Shorten the operator's deployment-ready timeout so the expected failure is detected in ~60s instead of the default.
+
+    // Shorten the operator's own deployment-ready timeout so the expected failure is
+    // detected in ~60s instead of the 300s default (operator/src/main.rs deployment_ready_timeout()).
     test_ctx
         .set_operator_related_image(&deployments, "DEPLOYMENT_READY_TIMEOUT_SECS", "60")
         .await?;

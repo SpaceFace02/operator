@@ -10,6 +10,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
+default = ["virtualization"]
 virtualization = []
 
 [dependencies]
