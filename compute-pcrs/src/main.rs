@@ -6,7 +6,7 @@
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use clap::Parser;
-use compute_pcrs_lib::*;
+use compute_pcrs_lib::{rootfs::RootFSTree, *};
 use kube::{Api, Client};
 use std::{fs::File, io::Read};
 
@@ -27,9 +27,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let kernels = format!("{IMAGE_VOLUME_MOUNTPOINT}/usr/lib/modules");
-    let esp = format!("{IMAGE_VOLUME_MOUNTPOINT}/usr/lib/bootupd/updates");
-
+    let rootfs_tree = RootFSTree::new(IMAGE_VOLUME_MOUNTPOINT)?;
     let mut os_release_file = File::open(format!("{IMAGE_VOLUME_MOUNTPOINT}/etc/os-release"))?;
     let mut os_release_content = String::new();
     os_release_file.read_to_string(&mut os_release_content)?;
@@ -46,7 +44,7 @@ async fn main() -> Result<()> {
     let mokvars = format!("/reference-values/mok-variables/{os_id}-{os_version_id}");
 
     let pcrs = vec![
-        compute_pcr4(&kernels, &esp, false, true),
+        compute_pcr4(rootfs_tree.vmlinuz(), rootfs_tree.esp(), false, true),
         // TODO: compute pcr7 when platform EFI vars can be elucidated
         compute_pcr14(&mokvars),
     ];
