@@ -102,20 +102,20 @@ named_test!(
         api.delete(TEC_NAME, &dp).await?;
 
         // Wait until it disappears
-        wait_for_resource_deleted(&api, TEC_NAME, scaled_timeout(120)).await?;
+        wait_for_resource_deleted(&api, TEC_NAME, scaled_duration(120)).await?;
 
         let deployments_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
-        let timeout = scaled_timeout(120);
-        wait_for_resource_deleted(&deployments_api, TRUSTEE_DEPLOYMENT, timeout).await?;
-        wait_for_resource_deleted(&deployments_api, REGISTER_SERVER_DEPLOYMENT, timeout).await?;
+        let duration = scaled_duration(120);
+        wait_for_resource_deleted(&deployments_api, TRUSTEE_DEPLOYMENT, duration).await?;
+        wait_for_resource_deleted(&deployments_api, REGISTER_SERVER_DEPLOYMENT, duration).await?;
 
         let images_api: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
-        wait_for_resource_deleted(&images_api, APPROVED_IMAGE_NAME, scaled_timeout(120)).await?;
+        wait_for_resource_deleted(&images_api, APPROVED_IMAGE_NAME, scaled_duration(120)).await?;
 
-        wait_for_resource_deleted(&machines, &machine_name, scaled_timeout(120)).await?;
-        wait_for_resource_deleted(&attestation_keys, &ak_name, scaled_timeout(120)).await?;
+        wait_for_resource_deleted(&machines, &machine_name, scaled_duration(120)).await?;
+        wait_for_resource_deleted(&attestation_keys, &ak_name, scaled_duration(120)).await?;
         let secrets_api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-        wait_for_resource_deleted(&secrets_api, &ak_name, scaled_timeout(120)).await?;
+        wait_for_resource_deleted(&secrets_api, &ak_name, scaled_duration(120)).await?;
 
         test_ctx.cleanup().await?;
 
@@ -143,7 +143,7 @@ async fn test_image_disallow() -> anyhow::Result<()> {
     let images: Api<ApprovedImage> = Api::namespaced(client.clone(), namespace);
     images.delete(APPROVED_IMAGE_NAME, &DeleteParams::default()).await?;
 
-    wait_for_resource_deleted(&images, APPROVED_IMAGE_NAME, scaled_timeout(180)).await?;
+    wait_for_resource_deleted(&images, APPROVED_IMAGE_NAME, scaled_duration(180)).await?;
 
     test_ctx.cleanup().await?;
     Ok(())
@@ -238,11 +238,11 @@ async fn test_attestation_key_lifecycle() -> anyhow::Result<()> {
     machines.delete(&machine_name, &dp).await?;
     test_ctx.info(format!("Deleted Machine: {machine_name}"));
 
-    wait_for_resource_deleted(&machines, &machine_name, scaled_timeout(120)).await?;
+    wait_for_resource_deleted(&machines, &machine_name, scaled_duration(120)).await?;
     test_ctx.info("Machine successfully deleted");
-    wait_for_resource_deleted(&attestation_keys, &ak_name, scaled_timeout(120)).await?;
+    wait_for_resource_deleted(&attestation_keys, &ak_name, scaled_duration(120)).await?;
     test_ctx.info("AttestationKey successfully deleted");
-    wait_for_resource_deleted(&secrets_api, &ak_name, scaled_timeout(120)).await?;
+    wait_for_resource_deleted(&secrets_api, &ak_name, scaled_duration(120)).await?;
     test_ctx.info("Secret successfully deleted");
 
     test_ctx.cleanup().await?;
@@ -397,7 +397,13 @@ async fn test_luks_key_sync() -> anyhow::Result<()> {
         )
         .await?;
 
-    test_ctx.wait_for_deployment_ready(&deployments, TRUSTEE_DEPLOYMENT, 120).await?;
+    wait_for_deployment_rollout(
+        client,
+        namespace,
+        TRUSTEE_DEPLOYMENT,
+        scaled_duration(120),
+    )
+    .await?;
 
     // Wait for the new pod to be ready
     test_ctx.info("Trustee deployment is ready after restart");
@@ -470,7 +476,7 @@ async fn test_luks_key_sync() -> anyhow::Result<()> {
     test_ctx.info("Machine1 secret deleted from KBS");
 
     // Verify the K8s Secret for machine1 is also deleted
-    wait_for_resource_deleted(&secrets_api, &machine1_uuid, 60).await?;
+    wait_for_resource_deleted(&secrets_api, &machine1_uuid, Duration::from_secs(60)).await?;
     test_ctx.info("Machine1 K8s secret deleted");
 
     test_ctx.cleanup().await?;
@@ -633,7 +639,13 @@ async fn test_attestation_key_sync() -> anyhow::Result<()> {
         )
         .await?;
 
-    test_ctx.wait_for_deployment_ready(&deployments, TRUSTEE_DEPLOYMENT, 120).await?;
+    wait_for_deployment_rollout(
+        client,
+        namespace,
+        TRUSTEE_DEPLOYMENT,
+        scaled_duration(120),
+    )
+    .await?;
     test_ctx.info("Trustee deployment is ready after restart");
 
     // Verify both AKs are re-registered to KBS after the trustee restart
@@ -692,7 +704,7 @@ async fn test_approved_image_readoption() -> anyhow::Result<()> {
 
     test_ctx.info(format!("Deleting TrustedExecutionCluster {TEC_NAME}"));
     clusters.delete(TEC_NAME, &Default::default()).await?;
-    wait_for_resource_deleted(&images, APPROVED_IMAGE_NAME, scaled_timeout(60)).await?;
+    wait_for_resource_deleted(&images, APPROVED_IMAGE_NAME, scaled_duration(60)).await?;
     test_ctx.info("ApprovedImage was removed after TrustedExecutionCluster deletion");
 
     let image = ApprovedImage {
