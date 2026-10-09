@@ -58,3 +58,4 @@ pub fn status_to_tpm_events(pcrs: &[ApprovedImageStatusPcrs]) -> Vec<TPMEvent> {
 fn parse_tpm_event_id(s: &str) -> Option<compute_pcrs_lib::tpmevents::TPMEventID> {
     serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
 }
+
