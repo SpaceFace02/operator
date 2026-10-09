@@ -723,14 +723,16 @@ impl TestContext {
                 &Patch::Strategic(patch),
             )
             .await?;
-        self.wait_for_deployment_ready(
-            deployments,
-            OPERATOR_DEPLOYMENT,
-            scaled_duration(120).as_secs(),
-        )
-        .await
-        .context("waiting for operator related-image env to roll out")?;
 
+        wait_for_deployment_rollout(
+            &self.client,
+            &self.test_namespace,
+            OPERATOR_DEPLOYMENT,
+            scaled_duration(120),
+        )
+        .await?;
+
+        // check for deletion timestamp on the old pod.
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), self.namespace());
         let lp = ListParams::default().labels("app=trusted-cluster-operator");
         let wait_old = async {
@@ -901,30 +903,37 @@ impl TestContext {
                 trusted_cluster_gen_path.display()
             ));
         }
-        let lookup = |key: &str| {
-            container_image_overrides
+        // lookup the image for the given key, if no value, then fall back to the component and fail_if_no_default boolean is set, then if the value is not found, this will function will throw an error.
+        let lookup = |key: &str, component: &str, fail_if_no_default: bool| -> Result<String> {
+            let overridden = container_image_overrides
                 .iter()
                 .find(|(k, _)| *k == key)
-                .map(|(_, v)| v.to_string())
+                .map(|(_, v)| v.to_string());
+            if let Some(v) = overridden {
+                return Ok(v);
+            }
+            if fail_if_no_default {
+                get_env(key)
+            } else {
+                Ok(env::var(key).unwrap_or_else(|_| default_image(component)))
+            }
         };
-        let trustee_image = lookup("TRUSTEE_IMAGE").map_or_else(|| get_env("TRUSTEE_IMAGE"), Ok)?;
+        let trustee_image = lookup("TRUSTEE_IMAGE", "", true)?;
         let approved_image = get_env("APPROVED_IMAGE")?;
 
         let mut args = vec!["-namespace", &ns, "-output-dir", &self.manifests_dir];
-        let operator_img = lookup("OPERATOR_IMAGE").unwrap_or_else(|| {
-            env::var("OPERATOR_IMAGE").unwrap_or_else(|_| default_image("trusted-cluster-operator"))
-        });
-        let compute_pcrs_img = lookup(RELATED_IMAGE_COMPUTE_PCRS).unwrap_or_else(|| {
-            env::var(RELATED_IMAGE_COMPUTE_PCRS).unwrap_or_else(|_| default_image("compute-pcrs"))
-        });
-        let reg_srv_img = lookup(RELATED_IMAGE_REGISTRATION_SERVER).unwrap_or_else(|| {
-            env::var(RELATED_IMAGE_REGISTRATION_SERVER)
-                .unwrap_or_else(|_| default_image("registration-server"))
-        });
-        let att_reg_img = lookup(RELATED_IMAGE_ATTESTATION_KEY_REGISTER).unwrap_or_else(|| {
-            env::var(RELATED_IMAGE_ATTESTATION_KEY_REGISTER)
-                .unwrap_or_else(|_| default_image("attestation-key-register"))
-        });
+        let operator_img = lookup("OPERATOR_IMAGE", "trusted-cluster-operator", false)?;
+        let compute_pcrs_img = lookup(RELATED_IMAGE_COMPUTE_PCRS, "compute-pcrs", false)?;
+        let reg_srv_img = lookup(
+            RELATED_IMAGE_REGISTRATION_SERVER,
+            "registration-server",
+            false,
+        )?;
+        let att_reg_img = lookup(
+            RELATED_IMAGE_ATTESTATION_KEY_REGISTER,
+            "attestation-key-register",
+            false,
+        )?;
         args.extend(&["-image", &operator_img]);
         args.extend(&["-pcrs-compute-image", &compute_pcrs_img]);
         args.extend(&["-trustee-image", &trustee_image]);
